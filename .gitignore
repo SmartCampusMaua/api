@@ -1,0 +1,51 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env
+.env.local
+
+# org -> InfluxDB instance registry (holds live tokens); influxdb.example.json is the
+# committed, sanitized template. The glob (not just the exact filename) also catches stray
+# backups like influxdb.json.bak, which would otherwise leak a live token just as easily.
+influxdb.json*
+
+# personal editor settings — not a project convention to impose on other contributors
+.vscode
+.env.development.local
+.env.test.local
+.env.production.local
+
+# vercel
+.vercel
+
+**/*.trace
+**/*.zip
+**/*.tar.gz
+**/*.tgz
+**/*.log
+package-lock.json
+**/*.bun

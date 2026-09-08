@@ -1,0 +1,19 @@
+{
+  "name": "api",
+  "version": "1.0.50",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "bun run --watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@elysiajs/openapi": "^1.4.15",
+    "elysia": "latest",
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^7.0.2"
+  },
+  "module": "src/index.js"
+}

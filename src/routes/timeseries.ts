@@ -1,6 +1,9 @@
 import { Elysia, t } from "elysia";
+import { zipSync } from "fflate";
 import { config, type OrgTarget } from "../config";
-import { InfluxDBError, querySql, queryRaw, type InfluxRow } from "../influxdb";
+import { InfluxDBError, querySql, queryRaw, columnExists, type InfluxRow } from "../influxdb";
+import { withMemoryCache, withDiskCache, buildCacheKey, rangeTtlMs } from "../cache";
+import { sensorRegistry, resolveSensorId } from "../sensors";
 
 // Each :org routes to a distinct InfluxDB instance (its own host + token) — this is the API's
 // own multi-instance registry, configured via influxdb.json in src/config.ts. It's unrelated
@@ -39,6 +42,7 @@ const TAG_CAMEL_TO_SNAKE: Record<string, string> = {
   provider: "provider",
   sensorType: "sensor_type",
   sensorId: "sensor_id",
+  assetId: "asset_id",
   eventType: "event_type",
 };
 
@@ -53,34 +57,26 @@ function camelValueToSnake(value: string): string {
   return value.replace(/([A-Z])/g, "_$1").toLowerCase();
 }
 
-// Per-table schema registry. Tables in this database aren't uniform: sensor_data has a
-// single exclusive value per row (value_bool/value_float/value_int) plus LoRaWAN/IP identity
-// columns; sensor_calibration has three concurrent numeric params and no identity columns;
+// Per-table schema registry. Tables in this database aren't uniform: sensor_data has a single
+// exclusive value per row (value_bool/value_float/value_int) plus LoRaWAN/IP identity columns;
 // audit_iot.raw has a text blob and no sensor_type/value columns at all. Shaped output (the
-// base route and /series) needs to know which shape it's dealing with; export/:format doesn't
-// (SELECT * works for any of them), which is why `shaped: false` only disables the former.
+// base/series route) needs to know which shape it's dealing with; export doesn't (SELECT * works
+// for any of them), which is why `shaped: false` only disables the former.
 // `tags` here are the camelCase URL names (keys of TAG_CAMEL_TO_SNAKE above).
 type TableConfig = {
   tags: readonly string[];
   hasIdentifier: boolean;
   valueColumns: readonly string[];
-  valueMode: "exclusive" | "multi" | "none";
+  valueMode: "exclusive" | "none";
   shaped: boolean;
 };
 
 const TABLES: Record<string, TableConfig> = {
   sensor_data: {
-    tags: ["devEui", "deviceId", "deviceModel", "macAddress", "provider", "sensorType", "sensorId"],
+    tags: ["devEui", "deviceId", "deviceModel", "macAddress", "provider", "sensorType", "sensorId", "assetId"],
     hasIdentifier: true,
     valueColumns: ["value_bool", "value_float", "value_int"],
     valueMode: "exclusive",
-    shaped: true,
-  },
-  sensor_calibration: {
-    tags: ["deviceId", "sensorType", "sensorId"],
-    hasIdentifier: false,
-    valueColumns: ["offset", "power", "scale"],
-    valueMode: "multi",
     shaped: true,
   },
   raw: {
@@ -99,21 +95,19 @@ const ALL_TAGS = [...new Set(Object.values(TABLES).flatMap((t) => t.tags))];
 // URL-facing domain/resource names, decoupled from InfluxDB's own database/table names — the
 // URL no longer exposes "iot_sensors"/"sensor_data"/etc. directly. Both iot_sensors and
 // audit_iot contain "iot", so domain "iot" + the other half of each name ("sensors"/"audit")
-// is what maps back to them. sensor_calibration has no standalone resource of its own — it's
-// only reachable via "sensors"' auto-join (see autoJoinCalibration below) — but the underlying
-// table (and its TABLES entry) still exists for that join's queries to use.
+// is what maps back to them.
 //
 // A "vehicle" domain (vehicle_telemetry / audit_vehicle) would follow the same shape once
 // there's real schema to build it from: both databases exist on the InfluxDB instance already
 // (the ingestion pipeline opens clients for them), but neither has ever had a table written to
 // it, and parse-mqtt-to-influxdb3's source has no write/record code for them yet either — so
 // there's currently nothing to verify a table/column registry entry against.
-type ResourceConfig = { database: string; table: string; autoJoinCalibration: boolean };
+type ResourceConfig = { database: string; table: string };
 
 const DOMAIN_RESOURCES: Record<string, Record<string, ResourceConfig>> = {
   iot: {
-    sensors: { database: "iot_sensors", table: "sensor_data", autoJoinCalibration: true },
-    audit: { database: "audit_iot", table: "raw", autoJoinCalibration: false },
+    sensors: { database: "iot_sensors", table: "sensor_data" },
+    audit: { database: "audit_iot", table: "raw" },
   },
 };
 
@@ -140,8 +134,10 @@ const DEFAULT_LIMIT = 1000;
 const MAX_LIMIT = 10000;
 const DEFAULT_INTERVAL_MINUTES = 1;
 
+// parquet's deliverable is a zip bundle of one .parquet file per UTC day (see queryExportBytes) —
+// :format=parquet still selects Parquet as the per-row format, the container is just zip.
 const EXPORT_FORMATS = {
-  parquet: { contentType: "application/vnd.apache.parquet", extension: "parquet" },
+  parquet: { contentType: "application/zip", extension: "zip" },
   csv: { contentType: "text/csv", extension: "csv" },
   json: { contentType: "application/json", extension: "json" },
 } as const;
@@ -265,10 +261,22 @@ type ResolvedFilter =
       endNs: bigint;
       chunks: Array<{ startNs: bigint; endNs: bigint }>;
       limit: number;
+      sensorIdAvailable: boolean;
+      assetIdAvailable: boolean;
     }
   | { ok: false; status: number; error: string };
 
-function resolveFilter(table: string, query: TimeseriesQuery): ResolvedFilter {
+// `sensorIdAvailable`/`assetIdAvailable` reflect whether sensor_id/asset_id currently exist as
+// real columns on this table (see columnExists() in src/influxdb.ts) — InfluxDB3 only registers a
+// tag column once at least one row has been written with it, so "documented in the ingestion
+// schema" and "actually queryable right now" are different questions. asset_id in particular
+// lags further behind than sensor_id: it's only populated for devices that have actually been
+// assigned to an asset in assets.json (optional, most devices don't have one yet), on top of the
+// same "no data written with it yet" gap sensor_id has. When a tag isn't available, it's dropped
+// from the filterable tags entirely (an explicit ?sensorId=/?assetId= is rejected with a clear
+// 400 rather than silently ignored, since silently ignoring a filter the caller explicitly asked
+// for could make unfiltered results look filtered).
+function resolveFilter(table: string, query: TimeseriesQuery, sensorIdAvailable: boolean, assetIdAvailable: boolean): ResolvedFilter {
   const config = TABLES[table];
   if (!config) {
     return {
@@ -278,9 +286,27 @@ function resolveFilter(table: string, query: TimeseriesQuery): ResolvedFilter {
     };
   }
 
+  if (!sensorIdAvailable && query.sensorId !== undefined) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Query param 'sensorId' is not available yet — no data in this database has been written with sensor_id yet.",
+    };
+  }
+  if (!assetIdAvailable && query.assetId !== undefined) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Query param 'assetId' is not available yet — no data in this database has been written with asset_id yet.",
+    };
+  }
+  let tags: readonly string[] = config.tags;
+  if (!sensorIdAvailable) tags = tags.filter((tag) => tag !== "sensorId");
+  if (!assetIdAvailable) tags = tags.filter((tag) => tag !== "assetId");
+
   // Tag filters are optional: with none given, the time bound below is the only
   // restriction, matching every device (and every sensor type, where applicable) in the window.
-  const filters = config.tags.filter((tag) => query[tag] !== undefined);
+  const filters = tags.filter((tag) => query[tag] !== undefined);
 
   const range = resolveTimeRange(query);
   if ("error" in range) {
@@ -304,15 +330,45 @@ function resolveFilter(table: string, query: TimeseriesQuery): ResolvedFilter {
   // Tag names are translated from the URL's camelCase to their real snake_case column names
   // via the fixed TAG_CAMEL_TO_SNAKE map above, never from raw path/query text directly, so
   // interpolating them here can't lead to SQL injection.
-  const tagFilters = filters.map((tag) => `"${TAG_CAMEL_TO_SNAKE[tag]}" = $${tag}`).join(" AND ");
-  const whereTags = tagFilters ? `${tagFilters} AND` : "";
+  //
+  // Any tag filter may be a comma-separated list (e.g. ?sensorId=a,b,c) — a single value builds
+  // "col" = $tag as before; multiple values build a parameterized "col" IN ($tag0, $tag1, ...)
+  // instead. Values are sorted before binding, purely so the same *set* of values always produces
+  // the same bind-param object (and so the same cache key) regardless of the order they were
+  // given in — the SQL result is identical either way, IN() is order-agnostic.
+  const tagClauses: string[] = [];
   const tagBindParams: Record<string, string> = {};
   for (const tag of filters) {
-    const value = query[tag] as string;
-    tagBindParams[tag] = tag === "sensorType" ? camelValueToSnake(value) : value;
-  }
+    const column = TAG_CAMEL_TO_SNAKE[tag];
+    const rawValue = query[tag] as string;
 
-  return { ok: true, table, config, whereTags, tagBindParams, startNs: range.startNs, endNs: range.endNs, chunks, limit };
+    // No comma: identical to this filter's previous behavior (including an empty-string value,
+    // which just matches zero rows rather than erroring — not a case worth special-casing).
+    if (!rawValue.includes(",")) {
+      tagBindParams[tag] = tag === "sensorType" ? camelValueToSnake(rawValue) : rawValue;
+      tagClauses.push(`"${column}" = $${tag}`);
+      continue;
+    }
+
+    const values = rawValue
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0)
+      .map((v) => (tag === "sensorType" ? camelValueToSnake(v) : v))
+      .sort();
+    if (values.length === 0) {
+      return { ok: false, status: 400, error: `Query param '${tag}' is a comma-separated list but resolved to zero values — check for stray commas.` };
+    }
+    const placeholders = values.map((value, i) => {
+      const paramName = `${tag}${i}`;
+      tagBindParams[paramName] = value;
+      return `$${paramName}`;
+    });
+    tagClauses.push(`"${column}" IN (${placeholders.join(", ")})`);
+  }
+  const whereTags = tagClauses.length ? `${tagClauses.join(" AND ")} AND` : "";
+
+  return { ok: true, table, config, whereTags, tagBindParams, startNs: range.startNs, endNs: range.endNs, chunks, limit, sensorIdAvailable, assetIdAvailable };
 }
 
 // Maps an InfluxDB "file scan limit" planning error to a 400 the caller can act on
@@ -331,19 +387,13 @@ function toErrorResponse(err: unknown, set: { status?: number | string }, tags: 
   throw err;
 }
 
-// "exclusive" tables (sensor_data) store one active value per row across several
-// mutually-exclusive typed columns; pick whichever is non-null.
+// sensor_data stores one active value per row across several mutually-exclusive typed columns;
+// pick whichever is non-null.
 function extractValue(row: InfluxRow, valueColumns: readonly string[]): number | boolean | null {
   for (const col of valueColumns) {
     if (row[col] !== null && row[col] !== undefined) return row[col] as number | boolean;
   }
   return null;
-}
-
-// "multi" tables (sensor_calibration) store several concurrent named values per row; include
-// them all as-is.
-function extractValues(row: InfluxRow, valueColumns: readonly string[]): Record<string, unknown> {
-  return Object.fromEntries(valueColumns.map((col) => [col, row[col]]));
 }
 
 function extractIdentifier(row: InfluxRow, config: TableConfig): Record<string, string> {
@@ -357,141 +407,92 @@ function extractIdentifier(row: InfluxRow, config: TableConfig): Record<string, 
   return {};
 }
 
-// Shared by the base route and /series: same columns, same casts, same filters — they only
-// differ in how the resulting rows get grouped/shaped into JSON afterward. Runs one query per
-// day-chunk (see splitIntoDayChunks), newest chunk first, stopping as soon as the overall
-// `limit` is satisfied so a request for recent data doesn't pay for querying older days at all.
+// One query per day-chunk (see splitIntoDayChunks), cached at that same day granularity — see
+// src/cache.ts. Each day-chunk is always queried/cached at a fixed MAX_LIMIT cap rather than the
+// caller's own (possibly much smaller) `limit`: the caller's `limit` is a whole-request budget
+// that depends on how many rows earlier (newer) chunks already produced, so baking it into the
+// per-day SQL would make the exact query — and therefore the cache key — different for every
+// differently-limited request, defeating reuse. Caching the day's full (capped) result once and
+// trimming to the caller's actual remaining budget afterward lets any number of differently
+// `limit`-ed requests share the same cached day.
+async function queryDayChunkTyped(
+  resolved: Extract<ResolvedFilter, { ok: true }>,
+  selectCols: string,
+  chunk: { startNs: bigint; endNs: bigint },
+  database: string,
+  target: OrgTarget
+): Promise<InfluxRow[]> {
+  // time is cast to VARCHAR (not just BIGINT) so InfluxDB emits it as a JSON string. Nanosecond
+  // epoch values exceed Number.MAX_SAFE_INTEGER, so if it came back as a JSON number it would
+  // already be rounded by the time our JSON parser touches it.
+  const sql = `
+    SELECT CAST(CAST(time AS BIGINT) AS VARCHAR) AS time, ${selectCols}
+    FROM "${resolved.table}"
+    WHERE ${resolved.whereTags} time >= arrow_cast(CAST($start AS BIGINT), 'Timestamp(Nanosecond, None)')
+      AND time <= arrow_cast(CAST($end AS BIGINT), 'Timestamp(Nanosecond, None)')
+    ORDER BY time DESC
+    LIMIT ${MAX_LIMIT}
+  `;
+  const bindParams = { ...resolved.tagBindParams, start: chunk.startNs.toString(), end: chunk.endNs.toString() };
+  const cacheKey = buildCacheKey({
+    host: target.host,
+    database,
+    table: resolved.table,
+    kind: `typed-rows:sid=${resolved.sensorIdAvailable}:aid=${resolved.assetIdAvailable}:cols=${selectCols}`,
+    startNs: chunk.startNs,
+    endNs: chunk.endNs,
+    bindParams: resolved.tagBindParams,
+  });
+  return withMemoryCache(cacheKey, rangeTtlMs(chunk.endNs), () => querySql(sql, bindParams, database, target));
+}
+
+// Same columns, same casts, same filters regardless of caller — grouping into the series shape
+// happens downstream of this. Queries newest chunk first, stopping as soon as the overall
+// `limit` is satisfied so a request for recent data doesn't pay for querying (or even reading
+// from cache) older days at all.
 async function queryTypedRows(resolved: Extract<ResolvedFilter, { ok: true }>, database: string, target: OrgTarget): Promise<InfluxRow[]> {
   const { config } = resolved;
   const identifierColumns = config.hasIdentifier ? ["dev_eui", "mac_address", "provider"] : [];
-  const columns = ["device_id", "sensor_id", ...identifierColumns, "sensor_type", ...config.valueColumns];
-  // Columns are double-quoted since a couple (e.g. sensor_calibration's "offset") collide with
-  // reserved SQL keywords otherwise.
+  const sensorIdColumn = resolved.sensorIdAvailable ? ["sensor_id"] : [];
+  const assetIdColumn = resolved.assetIdAvailable ? ["asset_id"] : [];
+  const columns = ["device_id", ...sensorIdColumn, ...assetIdColumn, ...identifierColumns, "sensor_type", ...config.valueColumns];
   const selectCols = columns.map((c) => `"${c}"`).join(", ");
 
   const rows: InfluxRow[] = [];
   for (const chunk of resolved.chunks) {
     const remaining = resolved.limit - rows.length;
     if (remaining <= 0) break;
-
-    // time is cast to VARCHAR (not just BIGINT) so InfluxDB emits it as a JSON string.
-    // Nanosecond epoch values exceed Number.MAX_SAFE_INTEGER, so if it came back as a JSON
-    // number it would already be rounded by the time our JSON parser touches it.
-    const sql = `
-      SELECT CAST(CAST(time AS BIGINT) AS VARCHAR) AS time, ${selectCols}
-      FROM "${resolved.table}"
-      WHERE ${resolved.whereTags} time >= arrow_cast(CAST($start AS BIGINT), 'Timestamp(Nanosecond, None)')
-        AND time <= arrow_cast(CAST($end AS BIGINT), 'Timestamp(Nanosecond, None)')
-      ORDER BY time DESC
-      LIMIT ${remaining}
-    `;
-    const bindParams = { ...resolved.tagBindParams, start: chunk.startNs.toString(), end: chunk.endNs.toString() };
-    rows.push(...(await querySql(sql, bindParams, database, target)));
+    const dayRows = await queryDayChunkTyped(resolved, selectCols, chunk, database, target);
+    rows.push(...dayRows.slice(0, remaining));
   }
   return rows;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Calibration join (sensor_data + sensor_calibration)
-// ─────────────────────────────────────────────────────────────────────────────
-// sensor_calibration has no time alignment with sensor_data — it's written rarely, whenever a
-// sensor is (re)calibrated — so "the calibration for this reading" means the most recent
-// sensor_calibration row for that sensor_id at or before the reading's time. InfluxDB3 doesn't
-// support this as a single SQL join yet (ASOF JOIN is recognized by the SQL parser but rejected
-// by the query planner as "not implemented" — verified against the live server), so it's done
-// here: one extra query for every relevant sensor's calibration history, then an in-memory
-// as-of lookup per reading.
-//
-// Keyed by sensor_id, not (device_id, sensor_type): a device can carry several sensors sharing
-// one sensor_type (e.g. three soil_moisture_raw probes on one lnv3_sm3dl, disambiguated by
-// device_index — see parse-mqtt-to-influxdb3's README), each with its own calibration curve, so
-// device_id+sensor_type alone can no longer identify which curve a row belongs to. A reading
-// with no sensor_id (not yet resolved to a sensors.json entry upstream) simply gets no
-// calibration — same as a sensor with none configured.
-
-type CalibrationRecord = { timeNs: bigint; offset: unknown; power: unknown; scale: unknown };
-
-async function fetchCalibrationLookup(
-  sensorIds: string[],
-  asOfNs: bigint,
-  database: string,
-  target: OrgTarget
-): Promise<Map<string, CalibrationRecord[]>> {
-  const valueColumns = TABLES.sensor_calibration.valueColumns;
-  const ids = sensorIds.filter((id) => id); // drop empty/unresolved sensor_id values
-  const lookup = new Map<string, CalibrationRecord[]>();
-  if (ids.length === 0) return lookup;
-
-  const bindParams: Record<string, string> = { end: asOfNs.toString() };
-  const idPlaceholders = ids.map((id, i) => {
-    bindParams[`s${i}`] = id;
-    return `$s${i}`;
-  });
-
-  const sql = `
-    SELECT CAST(CAST(time AS BIGINT) AS VARCHAR) AS time, sensor_id, ${valueColumns.map((c) => `"${c}"`).join(", ")}
-    FROM sensor_calibration
-    WHERE sensor_id IN (${idPlaceholders.join(", ")})
-      AND time <= arrow_cast(CAST($end AS BIGINT), 'Timestamp(Nanosecond, None)')
-    ORDER BY time DESC
-  `;
-  const rows = await querySql(sql, bindParams, database, target);
-
-  for (const row of rows) {
-    const key = row.sensor_id as string;
-    const list = lookup.get(key) ?? [];
-    // Already newest-first per key, since the SQL is ORDER BY time DESC and rows for the same
-    // key appear in that same relative order.
-    list.push({ timeNs: BigInt(row.time as string), offset: row.offset, power: row.power, scale: row.scale });
-    lookup.set(key, list);
-  }
-  return lookup;
-}
-
-function findApplicableCalibration(
-  lookup: Map<string, CalibrationRecord[]>,
-  sensorId: string,
-  timeNs: bigint
-): CalibrationRecord | undefined {
-  if (!sensorId) return undefined;
-  return lookup.get(sensorId)?.find((c) => c.timeNs <= timeNs);
-}
-
-// Calibration changes rarely — often not at all within a single query's window — so repeating
-// identical offset/power/scale on every reading is wasted payload. Instead, calibration fields
-// are only emitted on the *first* reading (in response order, i.e. newest-first) where a given
-// calibration record applies, and omitted on every subsequent reading for that same
-// (device, sensor_type) stream as long as it's still the same record — the run-length-encoding
-// equivalent for this "mostly constant, occasionally steps to a new value" shape. A reading's
-// own calibration state is "whichever explicit calibration most recently appeared at or before
-// it in the array" — so this only makes sense read sequentially, not accessed at random.
-// `tracker` is one Map per request/endpoint call, keyed by sensor_id (falling back to
-// `${deviceId}::${sensorType}` for a reading with no sensor_id yet), holding the identity (a
-// calibration record's own timeNs, or "none") last emitted for that key — identity is the
-// calibration row's own timestamp rather than its values, so two genuinely distinct calibration
-// events that happen to share identical numbers still count as a real change (unlikely in this
-// data, but not assumed away).
-function calibrationIdentity(calibration: CalibrationRecord | undefined): string {
-  return calibration ? calibration.timeNs.toString() : "none";
-}
-
-function calibrationChanged(tracker: Map<string, string>, key: string, calibration: CalibrationRecord | undefined): boolean {
-  const identity = calibrationIdentity(calibration);
-  const changed = tracker.get(key) !== identity;
-  tracker.set(key, identity);
-  return changed;
-}
+// The base/series response always carries sensor_id, sensor_type, and series — every other key
+// (asset_id, device_id, dev_eui/mac_address) is opt-in/opt-out via ?fields=, so a caller who only
+// wants the mandatory three doesn't have to receive (or filter out client-side) tags it doesn't
+// need. Names match the camelCase tag names already used for filtering (TAG_CAMEL_TO_SNAKE).
+const OPTIONAL_SERIES_FIELDS = ["deviceId", "assetId", "devEui", "macAddress"] as const;
+type OptionalSeriesField = (typeof OPTIONAL_SERIES_FIELDS)[number];
 
 const filterQuerySchema = t.Object({
   interval: t.Optional(t.String()),
   startTime: t.Optional(t.String()),
   endTime: t.Optional(t.String()),
   limit: t.Optional(t.String()),
+  // Only meaningful on /export (required there, validated manually — see the same
+  // clean-400-over-raw-schema-error reasoning used for every other param in this schema); the
+  // base/series route simply never reads it, same as it already ignores any other tag that
+  // doesn't apply to the resource being queried.
+  format: t.Optional(t.String()),
+  // Only meaningful on the base/series route (see OPTIONAL_SERIES_FIELDS above) — /export ignores
+  // it, since export is a raw SELECT * passthrough with no per-field shaping to opt in/out of.
+  fields: t.Optional(t.String()),
   ...Object.fromEntries(ALL_TAGS.map((tag) => [tag, t.Optional(t.String())])),
 });
 
 const NOT_SHAPED_ERROR = (table: string) =>
-  `Table "${table}" has no sensor_type/value columns to shape into readings or series. Use /export/:format instead.`;
+  `Table "${table}" has no sensor_type/value columns to shape into series. Use /export?format=... instead.`;
 
 export const timeseries = new Elysia()
   .get(
@@ -507,90 +508,22 @@ export const timeseries = new Elysia()
         set.status = resourceLookup.status;
         return { error: resourceLookup.error };
       }
-      const { database, table, autoJoinCalibration } = resourceLookup.resource;
+      const { database, table } = resourceLookup.resource;
 
-      const resolved = resolveFilter(table, query);
-      if (!resolved.ok) {
-        set.status = resolved.status;
-        return { error: resolved.error };
-      }
-      if (!resolved.config.shaped) {
-        set.status = 400;
-        return { error: NOT_SHAPED_ERROR(table) };
-      }
-
+      let sensorIdAvailable = false;
+      let assetIdAvailable = false;
       try {
-        const rows = await queryTypedRows(resolved, database, org.target);
-        const { config } = resolved;
-
-        const calibLookup = autoJoinCalibration && rows.length > 0
-          ? await fetchCalibrationLookup([...new Set(rows.map((r) => r.sensor_id as string))], resolved.endNs, database, org.target)
-          : undefined;
-        const calibTracker = new Map<string, string>();
-
-        const devices = new Map<string, { device_id: string; identifier: Record<string, string>; readings: Record<string, unknown>[] }>();
-        for (const row of rows) {
-          const deviceId = row.device_id as string;
-          const sensorId = (row.sensor_id as string) || undefined;
-          let device = devices.get(deviceId);
-          if (!device) {
-            device = { device_id: deviceId, identifier: extractIdentifier(row, config), readings: [] };
-            devices.set(deviceId, device);
-          }
-          // Calibration fields are included only on the first reading (newest-first) where a
-          // given calibration record applies, and omitted afterward for as long as it's still
-          // the same record — see calibrationChanged() above. Combined with "omitted, not
-          // null-filled, when no calibration exists at all", omission covers both "same as
-          // previous reading" and "no calibration ever" — a reader walking the array in order
-          // (carrying forward the last explicit value) reconstructs the correct state either way.
-          const calibration = calibLookup && sensorId ? findApplicableCalibration(calibLookup, sensorId, BigInt(row.time as string)) : undefined;
-          const calibrationChangedHere = calibrationChanged(calibTracker, sensorId ?? `${deviceId}::${row.sensor_type}`, calibration);
-          const calibrationFields =
-            calibration && calibrationChangedHere
-              ? { offset: calibration.offset, power: calibration.power, scale: calibration.scale }
-              : {};
-          // sensor_id is included on every reading (not just when calibration changes) — unlike
-          // calibration, which is genuinely redundant to repeat, sensor_id is the only thing that
-          // tells apart multiple physical sensors sharing one sensor_type on the same device
-          // (e.g. lnv3_sm3dl's three soil_moisture_raw probes) — omitting it would make those
-          // indistinguishable in this route's per-row shape.
-          device.readings.push(
-            config.valueMode === "exclusive"
-              ? { time: row.time, sensor_id: sensorId, [row.sensor_type as string]: extractValue(row, config.valueColumns), ...calibrationFields }
-              : { time: row.time, sensor_id: sensorId, sensor_type: row.sensor_type, ...extractValues(row, config.valueColumns) }
-          );
-        }
-
-        return [...devices.values()].map((device) => ({
-          device_id: device.device_id,
-          ...device.identifier,
-          readings: device.readings,
-        }));
+        sensorIdAvailable = TABLES[table]?.tags.includes("sensorId")
+          ? await columnExists(database, table, "sensor_id", org.target)
+          : false;
+        assetIdAvailable = TABLES[table]?.tags.includes("assetId")
+          ? await columnExists(database, table, "asset_id", org.target)
+          : false;
       } catch (err) {
-        return toErrorResponse(err, set, resolved.config.tags);
+        return toErrorResponse(err, set, TABLES[table]?.tags ?? []);
       }
-    },
-    {
-      params: t.Object({ org: t.String(), domain: t.String(), resource: t.String() }),
-      query: filterQuerySchema,
-    }
-  )
-  .get(
-    "/api/timeseries/v0.4/:org/:domain/:resource/series",
-    async ({ params, query, set }) => {
-      const org = resolveOrg(params.org);
-      if (!org.ok) {
-        set.status = org.status;
-        return { error: org.error };
-      }
-      const resourceLookup = resolveResource(params.domain, params.resource);
-      if (!resourceLookup.ok) {
-        set.status = resourceLookup.status;
-        return { error: resourceLookup.error };
-      }
-      const { database, table, autoJoinCalibration } = resourceLookup.resource;
 
-      const resolved = resolveFilter(table, query);
+      const resolved = resolveFilter(table, query, sensorIdAvailable, assetIdAvailable);
       if (!resolved.ok) {
         set.status = resolved.status;
         return { error: resolved.error };
@@ -600,34 +533,34 @@ export const timeseries = new Elysia()
         return { error: NOT_SHAPED_ERROR(table) };
       }
 
+      let selectedFields: Set<OptionalSeriesField> | undefined;
+      if (query.fields !== undefined) {
+        const requested = query.fields.split(",").map((f) => f.trim()).filter((f) => f.length > 0);
+        const unknown = requested.filter((f) => !(OPTIONAL_SERIES_FIELDS as readonly string[]).includes(f));
+        if (unknown.length > 0) {
+          set.status = 400;
+          return { error: `Query param 'fields' has unknown value(s): ${unknown.join(", ")}. Supported: ${OPTIONAL_SERIES_FIELDS.join(", ")}` };
+        }
+        selectedFields = new Set(requested as OptionalSeriesField[]);
+      }
+      const includeField = (field: OptionalSeriesField) => !selectedFields || selectedFields.has(field);
+
       try {
         const rows = await queryTypedRows(resolved, database, org.target);
         const { config } = resolved;
 
-        const calibLookup = autoJoinCalibration && rows.length > 0
-          ? await fetchCalibrationLookup([...new Set(rows.map((r) => r.sensor_id as string))], resolved.endNs, database, org.target)
-          : undefined;
-        const calibTracker = new Map<string, string>();
-
-        // One series per (device, sensor_type, sensor_id) — NOT just (device, sensor_type): a
-        // device can carry several sensors sharing one sensor_type (e.g. lnv3_sm3dl's three
-        // soil_moisture_raw probes, disambiguated by device_index upstream), and each is its own
-        // independent time series. Grouping by (device, sensor_type) alone would silently
-        // interleave multiple physical sensors' readings into one array. sensor_id is included
-        // in the grouping key even when empty (unresolved sensors all collapse into one group in
-        // that case, same degraded-but-not-wrong behavior as before sensor_id existed).
-        //
-        // "exclusive" tables (sensor_data) get [time, value], extended to [time, value, offset,
-        // power, scale] only on the first tuple (newest-first) where a given calibration record
-        // applies — omitted on subsequent tuples for as long as it's still the same record, same
-        // run-length reasoning as the base route's readings (see calibrationChanged() above) — so
-        // tuple length can vary within one response; check length rather than assuming a fixed
-        // arity, and carry forward the last 3-element tuple's values for any 2-element tuple in
-        // between. "multi" tables (sensor_calibration) get [time, ...valueColumns] in that
-        // column's fixed order, unaffected by calibration joining (it doesn't apply to that table).
+        // One series per (device, sensor_type, sensor_id) when sensor_id is available — NOT
+        // just (device, sensor_type): a device can carry several sensors sharing one sensor_type
+        // (e.g. lnv3_sm3dl's three soil_moisture_raw probes, disambiguated by device_index
+        // upstream), and each is its own independent time series. Grouping by (device,
+        // sensor_type) alone would silently interleave multiple physical sensors' readings into
+        // one array. When sensor_id isn't available at all, every reading's sensorId is
+        // undefined, so the group key collapses to (device, sensor_type) — the shape this always
+        // degraded to before sensor_id existed.
         type SeriesGroup = {
           device_id: string;
           sensor_id?: string;
+          asset_id?: string;
           identifier: Record<string, string>;
           sensor_type: string;
           series: unknown[][];
@@ -636,31 +569,35 @@ export const timeseries = new Elysia()
         for (const row of rows) {
           const deviceId = row.device_id as string;
           const sensorType = row.sensor_type as string;
-          const sensorId = (row.sensor_id as string) || undefined;
+          // Prefer InfluxDB's own sensor_id when it's real (authoritative for that specific
+          // row); fall back to the registry-resolved one otherwise — see resolveSensorId()'s
+          // own comment for why that fallback is only used when it's unambiguous.
+          const sensorId = (row.sensor_id as string) || resolveSensorId(deviceId, sensorType);
+          const assetId = (row.asset_id as string) || undefined;
           const key = `${deviceId}::${sensorType}::${sensorId ?? ""}`;
           let group = seriesByKey.get(key);
           if (!group) {
-            group = { device_id: deviceId, sensor_id: sensorId, identifier: extractIdentifier(row, config), sensor_type: sensorType, series: [] };
+            group = { device_id: deviceId, sensor_id: sensorId, asset_id: assetId, identifier: extractIdentifier(row, config), sensor_type: sensorType, series: [] };
             seriesByKey.set(key, group);
           }
-          if (config.valueMode === "exclusive") {
-            const tuple: unknown[] = [row.time, extractValue(row, config.valueColumns)];
-            const calibration = calibLookup && sensorId ? findApplicableCalibration(calibLookup, sensorId, BigInt(row.time as string)) : undefined;
-            const calibrationChangedHere = calibrationChanged(calibTracker, key, calibration);
-            if (calibration && calibrationChangedHere) tuple.push(calibration.offset, calibration.power, calibration.scale);
-            group.series.push(tuple);
-          } else {
-            group.series.push([row.time, ...config.valueColumns.map((col) => row[col])]);
-          }
+          group.series.push([row.time, extractValue(row, config.valueColumns)]);
         }
 
-        return [...seriesByKey.values()].map((group) => ({
-          device_id: group.device_id,
-          sensor_id: group.sensor_id,
-          ...group.identifier,
-          sensor_type: group.sensor_type,
-          series: group.series,
-        }));
+        // sensor_id, sensor_type, and series are always present — every other key is opt-in/out
+        // via ?fields= (see includeField above), and ordered sensor_id, asset_id, device_id,
+        // identifier (dev_eui/mac_address), sensor_type, series regardless of which are included.
+        return [...seriesByKey.values()].map((group) => {
+          const response: Record<string, unknown> = { sensor_id: group.sensor_id };
+          if (includeField("assetId") && group.asset_id) response.asset_id = group.asset_id;
+          if (includeField("deviceId")) response.device_id = group.device_id;
+          for (const [column, value] of Object.entries(group.identifier)) {
+            const field: OptionalSeriesField = column === "dev_eui" ? "devEui" : "macAddress";
+            if (includeField(field)) response[column] = value;
+          }
+          response.sensor_type = group.sensor_type;
+          response.series = group.series;
+          return response;
+        });
       } catch (err) {
         return toErrorResponse(err, set, resolved.config.tags);
       }
@@ -668,10 +605,16 @@ export const timeseries = new Elysia()
     {
       params: t.Object({ org: t.String(), domain: t.String(), resource: t.String() }),
       query: filterQuerySchema,
+      detail: {
+        summary: "Series, grouped by (device, sensor_type, sensor_id)",
+        description:
+          "One object per (device, sensor_type, sensor_id) with a `series` array of compact [time, value] tuples. `sensor_id`, `sensor_type`, and `series` are always present; `asset_id`/`device_id`/`dev_eui`/`mac_address` are optional and controlled by `?fields=` (comma-separated subset of deviceId,assetId,devEui,macAddress — omit to get all of them, same as before). Only works for resources whose table has sensor_type/value columns (`iot/sensors`) — 400 for raw resources like `iot/audit`, use /export instead. See README.md for the full response shape and day-chunking on wide ranges.",
+        tags: ["timeseries"],
+      },
     }
   )
   .get(
-    "/api/timeseries/v0.4/:org/:domain/:resource/export/:format",
+    "/api/timeseries/v0.4/:org/:domain/:resource/export",
     async ({ params, query, set }) => {
       const org = resolveOrg(params.org);
       if (!org.ok) {
@@ -685,15 +628,31 @@ export const timeseries = new Elysia()
       }
       const { database, table } = resourceLookup.resource;
 
-      if (!(params.format in EXPORT_FORMATS)) {
+      if (query.format === undefined || !(query.format in EXPORT_FORMATS)) {
         set.status = 400;
         return {
-          error: `Unsupported export format "${params.format}". Supported: ${Object.keys(EXPORT_FORMATS).join(", ")}`,
+          error: `Query param 'format' is required and must be one of: ${Object.keys(EXPORT_FORMATS).join(", ")} (got ${query.format === undefined ? "nothing" : `"${query.format}"`})`,
         };
       }
-      const format = params.format as ExportFormat;
+      const format = query.format as ExportFormat;
 
-      const resolved = resolveFilter(table, query);
+      // Export uses SELECT * (schema-agnostic — see queryExportBytes below), so this check is
+      // only for the WHERE clause: filtering by ?sensorId=/?assetId= would still fail if the
+      // column doesn't exist, same as the base route.
+      let sensorIdAvailable = false;
+      let assetIdAvailable = false;
+      try {
+        sensorIdAvailable = TABLES[table]?.tags.includes("sensorId")
+          ? await columnExists(database, table, "sensor_id", org.target)
+          : false;
+        assetIdAvailable = TABLES[table]?.tags.includes("assetId")
+          ? await columnExists(database, table, "asset_id", org.target)
+          : false;
+      } catch (err) {
+        return toErrorResponse(err, set, TABLES[table]?.tags ?? []);
+      }
+
+      const resolved = resolveFilter(table, query, sensorIdAvailable, assetIdAvailable);
       if (!resolved.ok) {
         set.status = resolved.status;
         return { error: resolved.error };
@@ -710,8 +669,63 @@ export const timeseries = new Elysia()
       }
     },
     {
-      params: t.Object({ org: t.String(), domain: t.String(), resource: t.String(), format: t.String() }),
+      params: t.Object({ org: t.String(), domain: t.String(), resource: t.String() }),
       query: filterQuerySchema,
+      detail: {
+        summary: "Raw export (csv/json/parquet)",
+        description:
+          "?format= (required: csv, json, or parquet) selects the output — same query/rows either way, only the serialization differs, which is why it's a query param here rather than a path segment the way /export itself is (export is a genuinely different code path from the base endpoint: raw SELECT *, no series grouping). SELECT * against the resource's underlying table, for every resource including non-shaped ones like `iot/audit`. csv/json are day-chunked and merged; parquet is day-chunked and bundled into a .zip (one file per UTC day) — see README.md for why, and the `limit` = rows-per-day caveat that's specific to parquet.",
+        tags: ["timeseries"],
+      },
+    }
+  )
+  .get(
+    "/api/timeseries/v0.4/_meta",
+    () => ({
+      orgs: Object.keys(config.influxdb.orgs),
+      domains: Object.fromEntries(
+        Object.entries(DOMAIN_RESOURCES).map(([domain, resources]) => [
+          domain,
+          Object.fromEntries(
+            Object.entries(resources).map(([resource, { table }]) => [
+              resource,
+              { tags: TABLES[table].tags, shaped: TABLES[table].shaped },
+            ])
+          ),
+        ])
+      ),
+    }),
+    {
+      detail: {
+        summary: "Registry metadata (orgs, domains, resources, tags)",
+        description:
+          "Live snapshot of the org registry and DOMAIN_RESOURCES/TABLES registries — lets a client (e.g. the query builder UI at /) build its form from the real, current registry instead of a hardcoded copy. Not a stable/versioned contract in the way the timeseries routes are.",
+        tags: ["timeseries"],
+      },
+    }
+  )
+  .get(
+    "/api/timeseries/v0.4/:org/sensors",
+    ({ params, set }) => {
+      const org = resolveOrg(params.org);
+      if (!org.ok) {
+        set.status = org.status;
+        return { error: org.error };
+      }
+      if (sensorRegistry.error) {
+        set.status = 502;
+        return { error: `Sensor registry unavailable: ${sensorRegistry.error}` };
+      }
+      return sensorRegistry.list;
+    },
+    {
+      params: t.Object({ org: t.String() }),
+      detail: {
+        summary: "Sensor + device + asset registry (for building a sensor picker)",
+        description:
+          "Flat list of {sensor_id, sensor_type, sensor_name?, device_id, device_model?, dev_eui?, mac_address?, asset_id?}, joined from parse-mqtt-to-influxdb3's sensors.json + devices.json + assets.json — the canonical source sensor_id is assigned from, not derived from InfluxDB itself. Currently the same list regardless of :org (only used for its existence check); 502 if the registry files aren't readable. `sensor_name` is only present on the small number of sensors that actually need a human label to disambiguate (e.g. multiple probes on one device) — fall back to `sensor_type` otherwise. `asset_id` is only present for devices actually assigned to an asset in assets.json — most aren't yet.",
+        tags: ["timeseries"],
+      },
     }
   );
 
@@ -721,12 +735,18 @@ export const timeseries = new Elysia()
 // and only for tables that actually have a provider column. The InfluxDB token never leaves
 // this server — callers hit this endpoint, not InfluxDB directly.
 //
-// json and csv are day-chunked and merged the same way queryTypedRows is (see there for why).
-// parquet is NOT chunked: unlike a JSON array or CSV rows, multiple Parquet byte streams can't
-// be concatenated into one valid file without re-encoding at the row-group level, which this
-// doesn't implement — so a parquet export still runs as a single query over the full range,
-// with the same file-scan-limit exposure the other formats had before chunking existed. Narrow
-// the range or add a tag filter if a wide parquet export hits that cap.
+// All three formats are day-chunked (see splitIntoDayChunks). json/csv merge their day-chunks
+// into one file the cheap way (string/array concatenation, see below) — but Parquet's binary
+// footer (schema + row-group offsets) has to be correct for the whole file, so pasting multiple
+// Parquet byte streams together the same way would produce a corrupt file, not a valid bigger
+// one, without a real Arrow/Parquet-writing dependency to re-encode row groups. Rather than add
+// that (or fall back to a single unchunked query with the file-scan cap exposure that implies —
+// see README.md's "Caching" section for the history here), each day's Parquet bytes are kept as
+// their own independently-valid file and bundled into a zip — exactly the "partitioned dataset"
+// shape big-data tools (DuckDB, pandas+pyarrow, Polars, Spark) already read natively via a
+// glob/multi-file dataset API, so nothing needs to be merged/re-encoded to use it. zipSync uses
+// level:0 (store, no compression): Parquet's column chunks are already Snappy/Zstd-compressed
+// internally, so compressing the zip container on top buys close to nothing and just costs CPU.
 async function queryExportBytes(
   resolved: Extract<ResolvedFilter, { ok: true }>,
   format: ExportFormat,
@@ -746,9 +766,31 @@ async function queryExportBytes(
     bindParams: { ...resolved.tagBindParams, start: startNs.toString(), end: endNs.toString() },
   });
 
+  // Cached on the disk (/tmp) tier, not memory — export payloads are meant for bulk/historical
+  // pulls and can be considerably larger than the typed-rows JSON the base route caches.
+  const exportCacheKey = (kind: string, startNs: bigint, endNs: bigint) =>
+    buildCacheKey({ host: target.host, database, table: resolved.table, kind, startNs, endNs, bindParams: resolved.tagBindParams });
+
   if (format === "parquet") {
-    const { sql, bindParams } = buildQuery(resolved.startNs, resolved.endNs, resolved.limit);
-    return new Uint8Array(await queryRaw(sql, format, bindParams, database, target));
+    // Unlike json/csv (which decouple `limit` from the cache key by always fetching/caching a
+    // fixed MAX_LIMIT-capped day and trimming afterward — see queryDayChunkTyped), each day's
+    // Parquet file here is capped at the caller's own `resolved.limit` directly, baked into that
+    // day's SQL/cache key. Trimming rows out of an already-fetched Parquet file would mean
+    // parsing and re-encoding it — exactly the cost this design avoids — so there's no cheap way
+    // to decouple. The practical effect: `limit` means "rows per day" for this format, not "rows
+    // total" like every other endpoint — documented in README.md. Cache reuse across genuinely
+    // identical repeated requests (the common hot-export case) is unaffected; only requests that
+    // hit the same day with a *different* limit value miss each other, which is rarer.
+    const entries: Record<string, [Uint8Array, { level: 0 }]> = {};
+    for (const chunk of resolved.chunks) {
+      const { sql, bindParams } = buildQuery(chunk.startNs, chunk.endNs, resolved.limit);
+      const cacheKey = exportCacheKey(`export-parquet-day:devtype=${!!selectExtra}:limit=${resolved.limit}`, chunk.startNs, chunk.endNs);
+      const bytes = await withDiskCache(cacheKey, rangeTtlMs(chunk.endNs), () => queryRaw(sql, format, bindParams, database, target));
+      if (bytes.byteLength === 0) continue; // no rows matched this day — skip rather than bundle an empty file
+      const day = new Date(Number(chunk.startNs / 1_000_000n)).toISOString().slice(0, 10);
+      entries[`${resolved.table}_${day}.parquet`] = [new Uint8Array(bytes), { level: 0 }];
+    }
+    return zipSync(entries);
   }
 
   if (format === "json") {
@@ -756,9 +798,11 @@ async function queryExportBytes(
     for (const chunk of resolved.chunks) {
       const remaining = resolved.limit - merged.length;
       if (remaining <= 0) break;
-      const { sql, bindParams } = buildQuery(chunk.startNs, chunk.endNs, remaining);
-      const bytes = await queryRaw(sql, format, bindParams, database, target);
-      merged.push(...(JSON.parse(new TextDecoder().decode(bytes)) as unknown[]));
+      const { sql, bindParams } = buildQuery(chunk.startNs, chunk.endNs, MAX_LIMIT);
+      const cacheKey = exportCacheKey(`export-json:devtype=${!!selectExtra}`, chunk.startNs, chunk.endNs);
+      const bytes = await withDiskCache(cacheKey, rangeTtlMs(chunk.endNs), () => queryRaw(sql, format, bindParams, database, target));
+      const dayRows = JSON.parse(new TextDecoder().decode(bytes)) as unknown[];
+      merged.push(...dayRows.slice(0, remaining));
     }
     return new TextEncoder().encode(JSON.stringify(merged));
   }
@@ -770,13 +814,14 @@ async function queryExportBytes(
   for (const chunk of resolved.chunks) {
     const remaining = resolved.limit - bodyLines.length;
     if (remaining <= 0) break;
-    const { sql, bindParams } = buildQuery(chunk.startNs, chunk.endNs, remaining);
-    const bytes = await queryRaw(sql, format, bindParams, database, target);
+    const { sql, bindParams } = buildQuery(chunk.startNs, chunk.endNs, MAX_LIMIT);
+    const cacheKey = exportCacheKey(`export-csv:devtype=${!!selectExtra}`, chunk.startNs, chunk.endNs);
+    const bytes = await withDiskCache(cacheKey, rangeTtlMs(chunk.endNs), () => queryRaw(sql, format, bindParams, database, target));
     const text = new TextDecoder().decode(bytes).replace(/\n+$/, "");
     if (!text) continue;
     const [chunkHeader, ...rows] = text.split("\n");
     if (header === undefined) header = chunkHeader;
-    bodyLines.push(...rows);
+    bodyLines.push(...rows.slice(0, remaining));
   }
   const csv = header === undefined ? "" : [header, ...bodyLines].join("\n") + "\n";
   return new TextEncoder().encode(csv);

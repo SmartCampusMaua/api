@@ -1,0 +1,12 @@
+.git
+node_modules
+README.md
+LICENSE
+.env
+.env.example
+influxdb.json
+influxdb.example.json
+.vscode
+.github
+.claude
+*.log

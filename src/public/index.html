@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SmartCampusMaua API — Query Builder</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666666;
+    --border: #d8d8d8;
+    --field: #f7f7f7;
+    --accent: #2563eb;
+    --accent-fg: #ffffff;
+    --error-bg: #fdecec;
+    --error-fg: #a11313;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --fg: #eaeaea;
+      --muted: #9a9a9a;
+      --border: #333640;
+      --field: #1d2026;
+      --accent: #4f8cff;
+      --accent-fg: #0a0a0a;
+      --error-bg: #3a1a1a;
+      --error-fg: #ff9c9c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1rem 4rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 1.25rem; margin: 0 0 0.25rem; }
+  .subtitle { color: var(--muted); margin: 0 0 1.75rem; font-size: 0.9rem; }
+  .subtitle a { color: inherit; }
+  fieldset {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.25rem 1.25rem;
+    margin: 0 0 1rem;
+  }
+  legend { padding: 0 0.4rem; font-weight: 600; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  .row { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; }
+  .field { display: flex; flex-direction: column; gap: 0.3rem; min-width: 180px; flex: 1; }
+  .field.narrow { flex: 0 1 140px; min-width: 120px; }
+  label { font-size: 0.8rem; color: var(--muted); }
+  input, select {
+    background: var(--field);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.45rem 0.55rem;
+    font-size: 0.9rem;
+    font-family: inherit;
+  }
+  input::placeholder { color: var(--muted); opacity: 0.7; }
+  #tags { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; }
+  .sensor-picker { flex-basis: 100%; display: flex; flex-direction: column; gap: 0.3rem; }
+  .sensor-list {
+    max-height: 260px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.6rem;
+    background: var(--field);
+  }
+  .sensor-list details { margin-bottom: 0.15rem; }
+  .sensor-list summary { cursor: pointer; font-size: 0.85rem; padding: 0.2rem 0; }
+  .sensor-list summary:hover { color: var(--accent); }
+  .sensor-row { display: flex; align-items: center; gap: 0.45rem; padding: 0.2rem 0 0.2rem 1.3rem; }
+  .sensor-row label { color: var(--fg); font-size: 0.85rem; cursor: pointer; }
+  .sensor-row .sensor-type { color: var(--muted); }
+  .sensor-row.hidden-by-search, details.hidden-by-search { display: none; }
+  .radio-group { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  .radio-group label { display: flex; align-items: center; gap: 0.35rem; color: var(--fg); font-size: 0.9rem; }
+  .note { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+  button {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border: none;
+    border-radius: 6px;
+    padding: 0.6rem 1.4rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.secondary {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 0.45rem 0.7rem;
+    font-weight: 500;
+    font-size: 0.8rem;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .url-row { display: flex; gap: 0.5rem; align-items: stretch; margin: 1rem 0; }
+  .url-row input { flex: 1; font-family: var(--mono); font-size: 0.8rem; }
+  #result {
+    margin-top: 1.5rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem;
+    max-height: 60vh;
+    overflow: auto;
+  }
+  #result pre { margin: 0; font-family: var(--mono); font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }
+  #result.error { background: var(--error-bg); color: var(--error-fg); border-color: var(--error-fg); }
+  #result .status { font-weight: 600; margin-bottom: 0.5rem; font-size: 0.85rem; }
+  #result:empty { display: none; }
+  .hidden { display: none !important; }
+  footer { margin-top: 2rem; font-size: 0.8rem; color: var(--muted); }
+  footer a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>SmartCampusMaua API — Query Builder</h1>
+  <p class="subtitle">Builds a real <code>/api/timeseries/&lt;version&gt;/...</code> URL from the live registry — nothing here is hardcoded against a fixed list of versions/orgs/resources. Full docs: <a href="/api/openapi">/api/openapi</a> · <a href="https://github.com/smartcampusmaua/api">README</a>.</p>
+
+  <fieldset>
+    <legend>Target</legend>
+    <div class="row">
+      <div class="field narrow">
+        <label for="version">version</label>
+        <select id="version"></select>
+      </div>
+      <div class="field narrow">
+        <label for="org">org</label>
+        <select id="org"></select>
+      </div>
+      <div class="field">
+        <label for="resource">domain / resource</label>
+        <select id="resource"></select>
+      </div>
+      <div class="field narrow">
+        <label for="endpoint">endpoint</label>
+        <select id="endpoint">
+          <option value="response">Response</option>
+          <option value="export">Export</option>
+        </select>
+      </div>
+      <div class="field narrow hidden" id="formatField">
+        <label for="format">format</label>
+        <select id="format">
+          <option value="parquet">parquet (.zip)</option>
+          <option value="csv">csv</option>
+          <option value="json">json</option>
+        </select>
+      </div>
+    </div>
+    <p class="note" id="shapedNote"></p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Tag filters (optional — blank = unfiltered)</legend>
+    <div id="tags"></div>
+  </fieldset>
+
+  <fieldset id="fieldsFieldset">
+    <legend>Response fields (Response only — sensor_id/sensor_type/series are always included)</legend>
+    <div class="row">
+      <label><input type="checkbox" id="field-deviceId" checked /> device_id</label>
+      <label><input type="checkbox" id="field-assetId" checked /> asset_id</label>
+      <label><input type="checkbox" id="field-identity" checked /> dev_eui / mac_address</label>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Time window</legend>
+    <div class="radio-group">
+      <label><input type="radio" name="timeMode" value="interval" checked /> Relative interval</label>
+      <label><input type="radio" name="timeMode" value="range" /> Absolute range</label>
+    </div>
+    <div class="row" style="margin-top: 0.75rem;">
+      <div class="field narrow" id="intervalField">
+        <label for="interval">interval (minutes)</label>
+        <input type="number" id="interval" min="1" placeholder="1 (default)" />
+      </div>
+      <div class="field hidden" id="startField">
+        <label for="startTime">startTime</label>
+        <input type="datetime-local" id="startTime" />
+      </div>
+      <div class="field hidden" id="endField">
+        <label for="endTime">endTime</label>
+        <input type="datetime-local" id="endTime" />
+      </div>
+      <div class="field narrow">
+        <label for="limit">limit</label>
+        <input type="number" id="limit" min="1" max="10000" placeholder="1000 (default)" />
+      </div>
+    </div>
+  </fieldset>
+
+  <button id="run">Build &amp; Run</button>
+
+  <div class="url-row">
+    <input type="text" id="urlBox" readonly placeholder="Built URL will appear here" />
+    <button class="secondary" id="copy" type="button">Copy</button>
+  </div>
+
+  <div id="result"></div>
+
+  <footer>Export requests (parquet/csv/json) open in a new tab and download directly — the response isn't rendered here.</footer>
+</main>
+
+<script>
+// Hardcoded rather than served by an endpoint — there's only one version today, and adding a
+// real "list of versions" API before a second version exists would be speculative. Extend this
+// array (newest first, so it's the default selection) when v0.5+ ships.
+const API_VERSIONS = ["v0.4"];
+const apiBase = () => `/api/timeseries/${el("version").value}`;
+let meta = null;
+// Sensor + device registry from GET /:org/sensors (parse-mqtt-to-influxdb3's sensors.json +
+// devices.json) — fetched once per org, reused across resource/tag re-renders so switching
+// resources doesn't re-fetch it every time.
+let sensors = [];
+let sensorsLoaded = false;
+
+const el = (id) => document.getElementById(id);
+
+async function loadMeta() {
+  const res = await fetch(`${apiBase()}/_meta`);
+  meta = await res.json();
+
+  const orgSelect = el("org");
+  orgSelect.innerHTML = meta.orgs.map((o) => `<option value="${o}">${o}</option>`).join("");
+
+  const resourceSelect = el("resource");
+  const options = [];
+  for (const [domain, resources] of Object.entries(meta.domains)) {
+    for (const resource of Object.keys(resources)) {
+      options.push({ domain, resource });
+    }
+  }
+  resourceSelect.innerHTML = options
+    .map((o) => `<option value="${o.domain}/${o.resource}">${o.domain}/${o.resource}</option>`)
+    .join("");
+
+  renderTags();
+  updateShapedState();
+  loadSensors();
+}
+
+async function loadSensors() {
+  const org = el("org").value;
+  if (!org) return;
+  try {
+    const res = await fetch(`${apiBase()}/${org}/sensors`);
+    sensors = res.ok ? await res.json() : [];
+  } catch {
+    sensors = [];
+  }
+  sensorsLoaded = true;
+  renderSensorPicker();
+}
+
+function currentResourceMeta() {
+  const [domain, resource] = el("resource").value.split("/");
+  return meta.domains[domain]?.[resource];
+}
+
+function renderTags() {
+  const rm = currentResourceMeta();
+  const container = el("tags");
+  if (!rm) { container.innerHTML = ""; return; }
+  container.innerHTML = rm.tags
+    .map((tag) =>
+      tag === "sensorId"
+        ? `
+      <div class="field sensor-picker">
+        <label for="sensorSearch">sensorId — search &amp; select one or more</label>
+        <input type="text" id="sensorSearch" placeholder="filter by device model, dev_eui/mac, sensor type or name..." />
+        <div id="sensorList" class="sensor-list"></div>
+        <p class="note" id="sensorSelectedCount"></p>
+      </div>`
+        : `
+      <div class="field">
+        <label for="tag-${tag}">${tag}</label>
+        <input type="text" id="tag-${tag}" data-tag="${tag}" placeholder="e.g. ${tagPlaceholder(tag)}" />
+      </div>`
+    )
+    .join("");
+  renderSensorPicker();
+}
+
+// Grouped by device (device_model + dev_eui/mac_address as the collapsible header, closed by
+// default — there are ~850 sensors across ~70 devices, too many to show flat) with a checkbox
+// per sensor labeled by sensor_name when the registry has one (only the sensors that actually
+// need it — e.g. multiple probes on one device — have it) and sensor_type otherwise.
+function renderSensorPicker() {
+  const list = el("sensorList");
+  if (!list) return; // current resource has no sensorId tag — nothing to render
+  if (!sensorsLoaded) {
+    list.innerHTML = `<p class="note" style="margin:0;">Loading sensors…</p>`;
+    return;
+  }
+  if (sensors.length === 0) {
+    list.innerHTML = `<p class="note" style="margin:0;">Sensor registry unavailable — falling back to typing a raw sensor_id isn't possible here either; check the server log for a [sensors] load error.</p>`;
+    return;
+  }
+  const byDevice = new Map();
+  for (const s of sensors) {
+    if (!byDevice.has(s.device_id)) byDevice.set(s.device_id, []);
+    byDevice.get(s.device_id).push(s);
+  }
+  list.innerHTML = [...byDevice.entries()]
+    .map(([deviceId, deviceSensors]) => {
+      const first = deviceSensors[0];
+      const identity = first.dev_eui ?? first.mac_address ?? deviceId;
+      const header = `${first.device_model ?? "unknown model"} · ${identity} (${deviceSensors.length})`;
+      const groupHaystack = `${first.device_model ?? ""} ${identity} ${deviceId}`.toLowerCase();
+      const rows = deviceSensors
+        .map((s) => {
+          const label = s.sensor_name ?? s.sensor_type;
+          const rowHaystack = `${groupHaystack} ${label} ${s.sensor_type} ${s.sensor_id}`.toLowerCase();
+          return `
+          <div class="sensor-row" data-haystack="${escapeHtml(rowHaystack)}">
+            <input type="checkbox" id="sensor-${s.sensor_id}" data-tag="sensorId" value="${s.sensor_id}" />
+            <label for="sensor-${s.sensor_id}">${escapeHtml(label)} <span class="sensor-type">(${escapeHtml(s.sensor_type)})</span></label>
+          </div>`;
+        })
+        .join("");
+      return `<details data-haystack="${escapeHtml(groupHaystack)}"><summary>${escapeHtml(header)}</summary>${rows}</details>`;
+    })
+    .join("");
+  updateSensorSelectedCount();
+}
+
+function filterSensorList() {
+  const q = el("sensorSearch").value.trim().toLowerCase();
+  for (const details of document.querySelectorAll("#sensorList details")) {
+    let anyVisible = false;
+    for (const row of details.querySelectorAll(".sensor-row")) {
+      const matches = !q || row.dataset.haystack.includes(q);
+      row.classList.toggle("hidden-by-search", !matches);
+      if (matches) anyVisible = true;
+    }
+    details.classList.toggle("hidden-by-search", !anyVisible);
+    if (q && anyVisible) details.open = true;
+  }
+}
+
+function updateSensorSelectedCount() {
+  const countEl = el("sensorSelectedCount");
+  if (!countEl) return;
+  const n = document.querySelectorAll('#sensorList input[type="checkbox"]:checked').length;
+  countEl.textContent = n > 0 ? `${n} sensor${n === 1 ? "" : "s"} selected` : "";
+}
+
+function tagPlaceholder(tag) {
+  const examples = {
+    devEui: "24e124136f484616",
+    deviceId: "019f7092-1baa-779f-b712-a9b740f7a6bc",
+    deviceModel: "em500_swl",
+    macAddress: "aa:bb:cc:dd:ee:ff",
+    provider: "chirpstackv4",
+    sensorType: "airTemp",
+    eventType: "payload_ingest",
+  };
+  return examples[tag] ?? tag;
+}
+
+// Resources without sensor_type/value columns (e.g. iot/audit) 400 on the Response endpoint —
+// steer the UI toward what actually works instead of just letting the user hit that error.
+function updateShapedState() {
+  const rm = currentResourceMeta();
+  const endpointSelect = el("endpoint");
+  const shapedNote = el("shapedNote");
+  const responseOpt = endpointSelect.querySelector('option[value="response"]');
+
+  if (rm && !rm.shaped) {
+    responseOpt.disabled = true;
+    endpointSelect.value = "export";
+    shapedNote.textContent = "This resource has no sensor_type/value columns — only Export is available (Response would 400).";
+  } else {
+    responseOpt.disabled = false;
+    shapedNote.textContent = "";
+  }
+  updateEndpointVisibility();
+}
+
+function updateEndpointVisibility() {
+  const isExport = el("endpoint").value === "export";
+  el("formatField").classList.toggle("hidden", !isExport);
+  // fields= only shapes the Response endpoint's per-key output — export is a raw SELECT *
+  // passthrough with nothing to opt in/out of, so hide the picker rather than let it build a
+  // query param the server will just ignore.
+  el("fieldsFieldset").classList.toggle("hidden", isExport);
+}
+
+function updateTimeModeVisibility() {
+  const mode = document.querySelector('input[name="timeMode"]:checked').value;
+  el("intervalField").classList.toggle("hidden", mode !== "interval");
+  el("startField").classList.toggle("hidden", mode !== "range");
+  el("endField").classList.toggle("hidden", mode !== "range");
+}
+
+function buildUrl() {
+  const org = el("org").value;
+  const [domain, resource] = el("resource").value.split("/");
+  const endpoint = el("endpoint").value;
+
+  let path = `${apiBase()}/${org}/${domain}/${resource}`;
+  if (endpoint === "export") path += "/export";
+
+  const params = new URLSearchParams();
+  if (endpoint === "export") params.set("format", el("format").value);
+  // One tag can now come from several inputs (the sensorId checkboxes) — collect all values per
+  // tag and join with a comma, matching the API's own comma-separated multi-value filter syntax
+  // (?sensorId=a,b,c). A plain text tag just ends up as a one-element "list".
+  const tagValues = new Map();
+  for (const input of document.querySelectorAll("#tags [data-tag]")) {
+    const tag = input.dataset.tag;
+    const value = input.type === "checkbox" ? (input.checked ? input.value : null) : input.value.trim();
+    if (!value) continue;
+    if (!tagValues.has(tag)) tagValues.set(tag, []);
+    tagValues.get(tag).push(value);
+  }
+  for (const [tag, values] of tagValues) {
+    params.set(tag, values.join(","));
+  }
+
+  const timeMode = document.querySelector('input[name="timeMode"]:checked').value;
+  if (timeMode === "interval") {
+    if (el("interval").value) params.set("interval", el("interval").value);
+  } else {
+    // datetime-local has no timezone of its own — new Date(value) parses it as the browser's
+    // local wall-clock time, and toISOString() converts that to the explicit-UTC-with-Z format
+    // the API requires (it rejects an unmarked datetime rather than guessing its timezone).
+    if (el("startTime").value) params.set("startTime", new Date(el("startTime").value).toISOString());
+    if (el("endTime").value) params.set("endTime", new Date(el("endTime").value).toISOString());
+  }
+  if (el("limit").value) params.set("limit", el("limit").value);
+
+  // Only emit ?fields= when the caller actually narrowed it — all three checked means "give me
+  // everything", the server's own default when the param is omitted, so leaving it off keeps the
+  // built URL clean in the common case.
+  if (endpoint !== "export") {
+    const selected = [];
+    if (el("field-deviceId").checked) selected.push("deviceId");
+    if (el("field-assetId").checked) selected.push("assetId");
+    if (el("field-identity").checked) selected.push("devEui", "macAddress");
+    if (selected.length < 4) params.set("fields", selected.join(","));
+  }
+
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
+async function run() {
+  const url = buildUrl();
+  el("urlBox").value = url;
+  const endpoint = el("endpoint").value;
+  const result = el("result");
+
+  if (endpoint === "export") {
+    result.className = "";
+    result.innerHTML = `<div class="status">Opened in a new tab for download.</div>`;
+    window.open(url, "_blank");
+    return;
+  }
+
+  result.className = "";
+  result.innerHTML = `<div class="status">Loading…</div>`;
+  try {
+    const res = await fetch(url);
+    const body = await res.json();
+    result.className = res.ok ? "" : "error";
+    result.innerHTML =
+      `<div class="status">${res.status} ${res.statusText}</div><pre>${escapeHtml(JSON.stringify(body, null, 2))}</pre>`;
+  } catch (err) {
+    result.className = "error";
+    result.innerHTML = `<div class="status">Request failed</div><pre>${escapeHtml(String(err))}</pre>`;
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+el("resource").addEventListener("change", () => { renderTags(); updateShapedState(); });
+el("org").addEventListener("change", loadSensors);
+// Switching versions means a different registry entirely (possibly different orgs/domains/
+// resources/tags) — reload from scratch rather than trying to patch the existing dropdowns.
+el("version").addEventListener("change", loadMeta);
+el("endpoint").addEventListener("change", updateEndpointVisibility);
+for (const radio of document.querySelectorAll('input[name="timeMode"]')) {
+  radio.addEventListener("change", updateTimeModeVisibility);
+}
+el("run").addEventListener("click", run);
+el("copy").addEventListener("click", () => {
+  if (!el("urlBox").value) return;
+  navigator.clipboard.writeText(new URL(el("urlBox").value, window.location.origin).toString());
+});
+// #tags itself is never replaced (only its innerHTML, by renderTags()), so delegating from it
+// means the sensor-search input and per-sensor checkboxes it creates never need their own
+// listeners re-attached after a re-render.
+el("tags").addEventListener("input", (e) => {
+  if (e.target.id === "sensorSearch") filterSensorList();
+});
+el("tags").addEventListener("change", (e) => {
+  if (e.target.matches('#sensorList input[type="checkbox"]')) updateSensorSelectedCount();
+});
+
+el("version").innerHTML = API_VERSIONS.map((v) => `<option value="${v}">${v}</option>`).join("");
+loadMeta();
+</script>
+</body>
+</html>
