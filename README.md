@@ -112,15 +112,15 @@ docker run -d -p 3333:3333 \
 
 `influxdb.json` is deliberately **not** baked into the image (it's excluded via `.dockerignore`, same token-security reasoning as the warning above) — it must be mounted at runtime. `docker/Dockerfile` sets `ENV INFLUXDB_CONFIG_FILE=/etc/api/influxdb.json`, a fixed absolute path baked into the image (the same pattern this project's sibling Go service, `mqtt-topic-rewrite-lns-chirpstackv4`, already uses for its own `devices.json` via `DEVICE_REGISTRY_FILE`) — so every deployment mounts to the same well-known path rather than needing to know an app-internal working directory.
 
-### Kubernetes: `influxdb.json` as a Secret volume
+### Kubernetes: config files as a Secret volume
 
-**Use a `Secret`, not a `ConfigMap`, for this file** — `influxdb.json` embeds a live InfluxDB bearer token, and a `ConfigMap`'s contents are stored and displayed as plain text to anyone who can `kubectl get configmap -o yaml` in the namespace. A `Secret` is the k8s-native primitive for exactly this case (base64-encoded at rest by default, tighter default RBAC, and the natural integration point if the cluster later adds real encryption-at-rest or an external secret manager). The volume-mount mechanics are otherwise identical between the two — swap `secret.secretName` for `configMap.name` below if you have a specific reason to use a `ConfigMap` instead.
+**Use a `Secret`, not a `ConfigMap`, for this directory** — `influxdb.json` embeds a live InfluxDB bearer token, and a `ConfigMap`'s contents are stored and displayed as plain text to anyone who can `kubectl get configmap -o yaml` in the namespace. `sensors.json`/`devices.json`/`assets.json` hold no secrets of their own, but they're colocated in the *same* `Secret` object anyway — see "mount the whole directory" below for why splitting them into a separate `ConfigMap` mounted at the same path would actually break hot-reload. A `Secret` is the k8s-native primitive for exactly this case (base64-encoded at rest by default, tighter default RBAC, and the natural integration point if the cluster later adds real encryption-at-rest or an external secret manager).
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: smartcampusmaua-api-influxdb-config
+  name: smartcampusmaua-api-config
 type: Opaque
 stringData:
   influxdb.json: |
@@ -130,6 +130,12 @@ stringData:
         { "org": "imt", "host": "http://influxdb.maua.br:8181", "token": "..." }
       ]
     }
+  sensors.json: |
+    { "sensors": [ ... ] }
+  devices.json: |
+    { "devices": [ ... ] }
+  assets.json: |
+    { "assets": [ ... ] }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -145,11 +151,11 @@ spec:
     spec:
       containers:
         - name: api
-          image: smartcampusmaua/api:0.1
+          image: smartcampusmaua/api:0.2
           ports:
             - containerPort: 3333
           volumeMounts:
-            - name: influxdb-config
+            - name: api-config
               mountPath: /etc/api
               readOnly: true
           livenessProbe:
@@ -157,14 +163,14 @@ spec:
           readinessProbe:
             httpGet: { path: /readyz, port: 3333 }
       volumes:
-        - name: influxdb-config
+        - name: api-config
           secret:
-            secretName: smartcampusmaua-api-influxdb-config
+            secretName: smartcampusmaua-api-config
 ```
 
-**Mount the whole directory (`/etc/api`), not the file itself via `subPath`.** This is the one detail worth getting right on the first try: a `subPath` mount (`mountPath: /etc/api/influxdb.json` + `subPath: influxdb.json`) is a common way to mount just one key from a `Secret`/`ConfigMap`, but subPath-mounted files are **not** updated when the underlying `Secret`/`ConfigMap` changes — only a full pod restart picks up the new content. Mounting the directory instead (as above) lets kubelet sync the projected volume's contents on its own (typically within about a minute of the `Secret` changing), which is what actually lets `src/config.ts`'s existing reload timer (`INFLUXDB_CONFIG_REFRESH_SEC`, default 30s) pick up a rotated token or a newly-added org **without a redeploy** — the entire reason that reload logic exists in the first place. Using `subPath` here would silently defeat it: the app would keep re-reading the same stale file every 30 seconds until something forced a pod restart.
+**Mount the whole directory (`/etc/api`), not individual files via `subPath`.** This is the one detail worth getting right on the first try: a `subPath` mount (`mountPath: /etc/api/influxdb.json` + `subPath: influxdb.json`) is a common way to mount just one key from a `Secret`/`ConfigMap`, but subPath-mounted files are **not** updated when the underlying `Secret`/`ConfigMap` changes — only a full pod restart picks up the new content. Mounting the directory instead (as above) lets kubelet sync the projected volume's contents on its own (typically within about a minute of the `Secret` changing), which is what actually lets each file's own reload timer (`INFLUXDB_CONFIG_REFRESH_SEC` for `influxdb.json`, `SENSORS_CONFIG_REFRESH_SEC` for the other three) pick up a change **without a redeploy** — the entire reason that reload logic exists in the first place. Using `subPath` for any of these four files would silently defeat it for that file specifically: the app would keep re-reading the same stale content until something forced a pod restart. This is also why `sensors.json`/`devices.json`/`assets.json` live in the *same* `Secret`/mount as `influxdb.json` rather than a separate `ConfigMap` volume mounted alongside it at a different subpath — a container can only have one thing mounted at a given directory, so keeping all four in one object is what makes "mount the whole directory once" possible at all.
 
-Updating the token: `kubectl create secret generic smartcampusmaua-api-influxdb-config --from-file=influxdb.json --dry-run=client -o yaml | kubectl apply -f -` (or edit the `Secret` in place) — no rollout needed, the running pods pick it up on their own within the sync interval above.
+Updating any of the four: `kubectl create secret generic smartcampusmaua-api-config --from-file=influxdb.json --from-file=sensors.json --from-file=devices.json --from-file=assets.json --dry-run=client -o yaml | kubectl apply -f -` (or edit the `Secret` in place) — no rollout needed, the running pods pick it up on their own within the sync interval above.
 
 ### Health endpoints
 
@@ -238,7 +244,7 @@ curl "http://localhost:3333/api/timeseries/v0.4/imt/sensors" | head -c 300
 ]
 ```
 
-This is a flat list, joined from [parse-mqtt-to-influxdb3](https://github.com/SmartCampusMaua/parse-mqtt-to-influxdb3)'s `sensors.json` (the canonical source `sensor_id` is actually assigned from — not derived from InfluxDB, which doesn't have `sensor_id` populated yet at all, see the footnote further down) and `devices.json` (device identity/model). **Interim implementation detail:** `src/sensors.ts` currently reads these via hardcoded relative paths (`../parse-mqtt-to-influxdb3/sensors.json`/`devices.json`, overridable via `SENSORS_CONFIG_FILE`/`DEVICES_CONFIG_FILE`), which only resolves when this repo and `parse-mqtt-to-influxdb3` are checked out side by side on the same machine — true for local dev, **not** true inside the Docker image or any real deployment. This is a deliberate placeholder until both files are made available to this service properly (mirrored the way `influxdb.json` is, or served by a shared registry endpoint); nothing downstream depends on *how* the files are reached, only on `sensorRegistry`'s output, so swapping the access method later is a one-file change. Unlike `influxdb.json`, a missing/broken registry here does **not** crash the process — hot-reloaded on the same timer as `influxdb.json` (`SENSORS_CONFIG_REFRESH_SEC`, default `30`), a load failure just makes `/sensors` (and so the picker) report the error and keeps the rest of the API working, since nothing about the core timeseries routes actually depends on this registry.
+This is a flat list, joined from [parse-mqtt-to-influxdb3](https://github.com/SmartCampusMaua/parse-mqtt-to-influxdb3)'s `sensors.json` (the canonical source `sensor_id` is actually assigned from — not derived from InfluxDB, which doesn't have `sensor_id` populated yet at all, see the footnote further down), `devices.json` (device identity/model), and `assets.json` (asset assignment). `src/sensors.ts` reads all three from `SENSORS_CONFIG_FILE`/`DEVICES_CONFIG_FILE`/`ASSETS_CONFIG_FILE`, defaulting to `../parse-mqtt-to-influxdb3/*.json` — a relative path that only resolves for a local checkout sitting next to this repo, so it's local-dev-only. The Docker image overrides all three to `/etc/api/{sensors,devices,assets}.json`, the same mounted directory `influxdb.json` already uses — see "Kubernetes: config files as a Secret volume" above. Nothing downstream depends on *how* the files are reached, only on `sensorRegistry`'s output, so pointing the env vars anywhere else (a different mount, a shared registry service later) is a config change, not a code change. Unlike `influxdb.json`, a missing/broken registry here does **not** crash the process — hot-reloaded on the same timer as `influxdb.json` (`SENSORS_CONFIG_REFRESH_SEC`, default `30`), a load failure just makes `/sensors` (and so the picker) report the error and keeps the rest of the API working, since nothing about the core timeseries routes actually depends on this registry.
 
 ## API
 

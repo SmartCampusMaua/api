@@ -28,4 +28,4 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
-          tags: smartcampusmaua/api:0.1
+          tags: smartcampusmaua/api:0.2

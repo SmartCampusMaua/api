@@ -32,6 +32,12 @@ yarn-error.log*
 # committed, sanitized template. The glob (not just the exact filename) also catches stray
 # backups like influxdb.json.bak, which would otherwise leak a live token just as easily.
 influxdb.json*
+# sensors.json/devices.json/assets.json aren't secret, but they're parse-mqtt-to-influxdb3's data,
+# not this repo's — a local copy at the repo root (for local testing without the sibling checkout)
+# shouldn't get committed here and drift out of sync with the real source of truth.
+sensors.json*
+devices.json*
+assets.json*
 
 # personal editor settings — not a project convention to impose on other contributors
 .vscode
