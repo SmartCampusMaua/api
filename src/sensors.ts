@@ -31,9 +31,14 @@ type DeviceEntry = {
 };
 // device_ids is authored on the asset side (one asset -> many devices), same as
 // parse-mqtt-to-influxdb3's AssetEntry/GetAssetsMap — resolved below into a
-// device_id -> asset_id lookup, the inverse direction SensorInfo actually needs.
+// device_id -> asset lookup, the inverse direction SensorInfo actually needs.
+// asset_name/asset_slug are optional since older entries may not have them yet — asset_slug is
+// the stable, lowercase-kebab-case filter key (?assetSlug=), asset_name is a free-text display
+// label with no filtering role, same split as sensor_id/sensor_name already have for sensors.
 type AssetEntry = {
   asset_id: string;
+  asset_name?: string;
+  asset_slug?: string;
   device_ids?: string[];
 };
 
@@ -46,6 +51,8 @@ export type SensorInfo = {
   dev_eui?: string;
   mac_address?: string;
   asset_id?: string;
+  asset_name?: string;
+  asset_slug?: string;
 };
 
 const SENSORS_FILE = process.env.SENSORS_CONFIG_FILE ?? "../parse-mqtt-to-influxdb3/sensors.json";
@@ -84,14 +91,15 @@ function loadRegistry(): SensorInfo[] {
   if (!Array.isArray(assetsFile.assets)) throw new Error(`${ASSETS_FILE}: "assets" must be an array`);
 
   const devicesById = new Map(devicesFile.devices.map((d) => [d.device_id, d]));
-  const assetIdByDeviceId = new Map<string, string>();
+  const assetByDeviceId = new Map<string, AssetEntry>();
   for (const asset of assetsFile.assets) {
     for (const deviceId of asset.device_ids ?? []) {
-      assetIdByDeviceId.set(deviceId, asset.asset_id);
+      assetByDeviceId.set(deviceId, asset);
     }
   }
   return sensorsFile.sensors.map((s) => {
     const device = devicesById.get(s.device_id);
+    const asset = assetByDeviceId.get(s.device_id);
     return {
       sensor_id: s.sensor_id,
       sensor_type: s.sensor_type,
@@ -100,27 +108,61 @@ function loadRegistry(): SensorInfo[] {
       device_model: device?.device_model,
       dev_eui: device?.dev_eui,
       mac_address: device?.mac_address,
-      asset_id: assetIdByDeviceId.get(s.device_id),
+      asset_id: asset?.asset_id,
+      asset_name: asset?.asset_name,
+      asset_slug: asset?.asset_slug,
     };
   });
 }
 
-// Keyed by `${device_id}::${sensor_type}` -> every matching sensor_id, so resolveSensorId() below
-// is an O(1) lookup instead of an O(registry size) scan per row — this gets called once per
-// reading/tuple in a response, so it needs to be cheap. Rebuilt alongside `registry` on every
-// load/reload, never mutated in place (same reasoning as config.ts's `orgs`: reassignment is
-// atomic, so a reader never sees a half-rebuilt index).
-let sensorIdIndex = new Map<string, string[]>();
+// Four lookups built in one pass over `list`, all keyed for O(1) access instead of an O(registry
+// size) scan per row/request — sensorIdIndex gets called once per reading/tuple in a series
+// response, and deviceIdIndex/assetIdIndex/assetSlugIndex back the /sensors endpoint's own
+// ?deviceId=/?assetId=/?assetSlug= filters (see below), so all need to stay cheap even as the
+// registry grows toward thousands of sensors. Rebuilt alongside `registry` on every load/reload,
+// never mutated in place (same reasoning as config.ts's `orgs`: reassignment is atomic, so a
+// reader never sees a half-rebuilt index).
+let sensorIdIndex = new Map<string, string[]>(); // "${device_id}::${sensor_type}" -> sensor_id[]
+let deviceIdIndex = new Map<string, SensorInfo[]>(); // device_id -> every sensor on that device
+let assetIdIndex = new Map<string, SensorInfo[]>(); // asset_id -> every sensor on that asset's devices
+let assetSlugIndex = new Map<string, SensorInfo[]>(); // asset_slug -> same, keyed by the human-typeable slug instead
 
-function buildSensorIdIndex(list: SensorInfo[]): Map<string, string[]> {
-  const index = new Map<string, string[]>();
+function buildIndexes(list: SensorInfo[]) {
+  const sensorIds = new Map<string, string[]>();
+  const deviceIds = new Map<string, SensorInfo[]>();
+  const assetIds = new Map<string, SensorInfo[]>();
+  const assetSlugs = new Map<string, SensorInfo[]>();
   for (const s of list) {
-    const key = `${s.device_id}::${s.sensor_type}`;
-    const existing = index.get(key);
-    if (existing) existing.push(s.sensor_id);
-    else index.set(key, [s.sensor_id]);
+    const sensorKey = `${s.device_id}::${s.sensor_type}`;
+    const sensorMatches = sensorIds.get(sensorKey);
+    if (sensorMatches) sensorMatches.push(s.sensor_id);
+    else sensorIds.set(sensorKey, [s.sensor_id]);
+
+    const deviceMatches = deviceIds.get(s.device_id);
+    if (deviceMatches) deviceMatches.push(s);
+    else deviceIds.set(s.device_id, [s]);
+
+    if (s.asset_id) {
+      const assetMatches = assetIds.get(s.asset_id);
+      if (assetMatches) assetMatches.push(s);
+      else assetIds.set(s.asset_id, [s]);
+    }
+
+    if (s.asset_slug) {
+      const slugMatches = assetSlugs.get(s.asset_slug);
+      if (slugMatches) slugMatches.push(s);
+      else assetSlugs.set(s.asset_slug, [s]);
+    }
   }
-  return index;
+  return { sensorIds, deviceIds, assetIds, assetSlugs };
+}
+
+function applyIndexes(list: SensorInfo[]): void {
+  const { sensorIds, deviceIds, assetIds, assetSlugs } = buildIndexes(list);
+  sensorIdIndex = sensorIds;
+  deviceIdIndex = deviceIds;
+  assetIdIndex = assetIds;
+  assetSlugIndex = assetSlugs;
 }
 
 // Resolves a row's sensor_id from the registry when InfluxDB's own sensor_id column doesn't have
@@ -136,12 +178,27 @@ export function resolveSensorId(deviceId: string, sensorType: string): string | 
   return matches?.length === 1 ? matches[0] : undefined;
 }
 
+// Backs the /sensors endpoint's ?deviceId=/?assetId=/?assetSlug= filters — an unknown id/slug is
+// a normal empty result, not an error, same as any other tag filter elsewhere in this API.
+export function sensorsByDeviceId(deviceId: string): SensorInfo[] {
+  return deviceIdIndex.get(deviceId) ?? [];
+}
+export function sensorsByAssetId(assetId: string): SensorInfo[] {
+  return assetIdIndex.get(assetId) ?? [];
+}
+// The main timeseries/export routes resolve ?assetSlug= into the equivalent asset_id(s) via this
+// (see resolveAssetSlugFilter in routes/timeseries.ts) — InfluxDB itself only ever has asset_id as
+// a real tag/column, never asset_slug, so the slug never reaches a SQL query directly.
+export function sensorsByAssetSlug(assetSlug: string): SensorInfo[] {
+  return assetSlugIndex.get(assetSlug) ?? [];
+}
+
 let registry: SensorInfo[] = [];
 let loadError: string | undefined;
 
 try {
   registry = loadRegistry();
-  sensorIdIndex = buildSensorIdIndex(registry);
+  applyIndexes(registry);
   console.log(`[sensors] loaded ${SENSORS_FILE} + ${DEVICES_FILE} + ${ASSETS_FILE}: ${registry.length} sensors`);
 } catch (err) {
   loadError = err instanceof Error ? err.message : String(err);
@@ -151,7 +208,7 @@ try {
 setInterval(() => {
   try {
     registry = loadRegistry();
-    sensorIdIndex = buildSensorIdIndex(registry);
+    applyIndexes(registry);
     loadError = undefined;
   } catch (err) {
     loadError = err instanceof Error ? err.message : String(err);

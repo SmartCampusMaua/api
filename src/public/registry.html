@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SmartCampusMaua API — Registry</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #666666;
+    --border: #d8d8d8;
+    --field: #f7f7f7;
+    --accent: #2563eb;
+    --accent-fg: #ffffff;
+    --error-bg: #fdecec;
+    --error-fg: #a11313;
+    --ok-bg: #eafbea;
+    --ok-fg: #1a7f37;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --fg: #eaeaea;
+      --muted: #9a9a9a;
+      --border: #333640;
+      --field: #1d2026;
+      --accent: #4f8cff;
+      --accent-fg: #0a0a0a;
+      --error-bg: #3a1a1a;
+      --error-fg: #ff9c9c;
+      --ok-bg: #163a1e;
+      --ok-fg: #7ee08a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1rem 4rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 1.25rem; margin: 0 0 0.25rem; }
+  h2 { font-size: 1rem; margin: 0 0 0.75rem; }
+  .subtitle { color: var(--muted); margin: 0 0 1.5rem; font-size: 0.9rem; }
+  .subtitle a { color: inherit; }
+  fieldset {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.25rem 1.25rem;
+    margin: 0 0 1rem;
+  }
+  legend { padding: 0 0.4rem; font-weight: 600; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  .row { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 0.3rem; min-width: 160px; flex: 1; }
+  .field.narrow { flex: 0 1 130px; min-width: 100px; }
+  label { font-size: 0.8rem; color: var(--muted); }
+  input, select {
+    background: var(--field);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.45rem 0.55rem;
+    font-size: 0.9rem;
+    font-family: inherit;
+  }
+  input::placeholder { color: var(--muted); opacity: 0.7; }
+  .note { font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem; }
+  button {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border: none;
+    border-radius: 6px;
+    padding: 0.55rem 1.2rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.secondary {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 0.4rem 0.7rem;
+    font-weight: 500;
+    font-size: 0.8rem;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .tabs { display: flex; gap: 0.4rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
+  .tabs button { background: transparent; color: var(--fg); border: 1px solid var(--border); font-weight: 500; }
+  .tabs button.active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .tabpanel { display: none; }
+  .tabpanel.active { display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.45rem 0.55rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.02em; }
+  tbody tr:hover { background: var(--field); }
+  .table-wrap { max-height: 360px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 1rem; }
+  .table-wrap table { border: none; }
+  .table-wrap thead th { position: sticky; top: 0; background: var(--bg); }
+  .mono { font-family: var(--mono); font-size: 0.78rem; }
+  .muted { color: var(--muted); }
+  #status { margin: 1rem 0; }
+  #status .msg { border-radius: 8px; padding: 0.65rem 0.9rem; font-size: 0.85rem; }
+  #status .msg.error { background: var(--error-bg); color: var(--error-fg); }
+  #status .msg.ok { background: var(--ok-bg); color: var(--ok-fg); }
+  #status:empty { display: none; }
+  .hidden { display: none !important; }
+  footer { margin-top: 2rem; font-size: 0.8rem; color: var(--muted); }
+  footer a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>SmartCampusMaua API — Registry</h1>
+  <p class="subtitle">Create/edit devices, assets, sensors, and Modbus channel routing — backed by Postgres (<code>/api/registry/v0.1/...</code>), replacing parse-mqtt-to-influxdb3's JSON files as the source of truth. Full docs: <a href="/api/openapi">/api/openapi</a> · <a href="https://github.com/smartcampusmaua/api">README</a>.</p>
+
+  <fieldset>
+    <legend>Write token</legend>
+    <div class="row">
+      <div class="field">
+        <label for="token">Bearer token (required for create/edit — reads work without it)</label>
+        <input type="password" id="token" placeholder="paste your REGISTRY_WRITE_TOKEN here" />
+      </div>
+      <button class="secondary" id="saveToken" type="button">Save</button>
+    </div>
+    <p class="note">Held only in this browser tab's <code>sessionStorage</code> — never sent anywhere except as the <code>Authorization</code> header on writes to this API, and cleared when the tab closes. This is a stopgap ahead of real per-user auth, not a login system.</p>
+  </fieldset>
+
+  <div id="status"></div>
+
+  <div class="tabs">
+    <button type="button" data-tab="assets" class="active">Assets</button>
+    <button type="button" data-tab="devices">Devices</button>
+    <button type="button" data-tab="sensors">Sensors</button>
+    <button type="button" data-tab="channels">Modbus channels</button>
+  </div>
+
+  <!-- ── Assets ─────────────────────────────────────────────────────────────────────── -->
+  <section class="tabpanel active" id="tab-assets">
+    <h2>Create / edit asset</h2>
+    <form id="form-asset">
+      <input type="hidden" id="asset-id" />
+      <div class="row">
+        <div class="field">
+          <label for="asset-name">Name</label>
+          <input type="text" id="asset-name" required placeholder="Pump Station 3" />
+        </div>
+        <div class="field">
+          <label for="asset-slug">Slug (lowercase, hyphens only)</label>
+          <input type="text" id="asset-slug" required placeholder="pump-station-3" pattern="[a-z0-9]+(-[a-z0-9]+)*" />
+        </div>
+        <div class="field">
+          <label for="asset-parent">Parent asset (optional)</label>
+          <select id="asset-parent"><option value="">— none —</option></select>
+        </div>
+      </div>
+      <div class="row">
+        <button type="submit" id="asset-submit">Create asset</button>
+        <button type="button" class="secondary" id="asset-cancel">Cancel edit</button>
+      </div>
+    </form>
+    <h2 style="margin-top:1.5rem">Existing assets</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Name</th><th>Slug</th><th>Parent</th><th>Devices attached</th><th>Attach device</th><th></th></tr></thead>
+      <tbody id="assets-body"></tbody>
+    </table></div>
+  </section>
+
+  <!-- ── Devices ────────────────────────────────────────────────────────────────────── -->
+  <section class="tabpanel" id="tab-devices">
+    <h2>Create / edit device</h2>
+    <form id="form-device">
+      <input type="hidden" id="device-id" />
+      <div class="row">
+        <div class="field">
+          <label for="device-model">Model</label>
+          <input type="text" id="device-model" required placeholder="uc300" />
+        </div>
+        <div class="field narrow">
+          <label for="device-type">Type</label>
+          <select id="device-type"><option value="lorawan">lorawan</option><option value="ip">ip</option></select>
+        </div>
+        <div class="field">
+          <label for="device-serial">Serial number</label>
+          <input type="text" id="device-serial" />
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="device-eui">Dev EUI (LoRaWAN)</label>
+          <input type="text" id="device-eui" />
+        </div>
+        <div class="field">
+          <label for="device-mac">MAC address (IP)</label>
+          <input type="text" id="device-mac" />
+        </div>
+        <div class="field">
+          <label for="device-asset">Asset (home location)</label>
+          <select id="device-asset"><option value="">— none —</option></select>
+        </div>
+      </div>
+      <div class="row">
+        <button type="submit" id="device-submit">Create device</button>
+        <button type="button" class="secondary" id="device-cancel">Cancel edit</button>
+      </div>
+    </form>
+    <h2 style="margin-top:1.5rem">Existing devices</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Model</th><th>Type</th><th>Identity</th><th>Asset</th><th></th></tr></thead>
+      <tbody id="devices-body"></tbody>
+    </table></div>
+  </section>
+
+  <!-- ── Sensors ────────────────────────────────────────────────────────────────────── -->
+  <section class="tabpanel" id="tab-sensors">
+    <h2>Create / edit sensor</h2>
+    <form id="form-sensor">
+      <input type="hidden" id="sensor-id" />
+      <div class="row">
+        <div class="field">
+          <label for="sensor-type">Sensor type</label>
+          <input type="text" id="sensor-type" required placeholder="air_temp" />
+        </div>
+        <div class="field">
+          <label for="sensor-device">Device</label>
+          <select id="sensor-device" required></select>
+        </div>
+        <div class="field narrow">
+          <label for="sensor-index">Device index</label>
+          <input type="number" id="sensor-index" min="0" />
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="sensor-name">Display name (optional)</label>
+          <input type="text" id="sensor-name" placeholder="Depth 10cm" />
+        </div>
+        <div class="field">
+          <label for="sensor-asset">Asset override (optional — leave unset to inherit the device's asset)</label>
+          <select id="sensor-asset"><option value="">— inherit from device —</option></select>
+        </div>
+      </div>
+      <p class="note">Only set the asset override for the exception case: a bus-listening device (e.g. a Modbus RS485 controller) relaying readings for a <em>different</em> physical asset than its own. Leave it unset for every ordinary sensor.</p>
+      <div class="row">
+        <button type="submit" id="sensor-submit">Create sensor</button>
+        <button type="button" class="secondary" id="sensor-cancel">Cancel edit</button>
+      </div>
+    </form>
+    <h2 style="margin-top:1.5rem">Existing sensors</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Type</th><th>Name</th><th>Device</th><th>Asset override</th><th></th></tr></thead>
+      <tbody id="sensors-body"></tbody>
+    </table></div>
+  </section>
+
+  <!-- ── Modbus channels ────────────────────────────────────────────────────────────── -->
+  <section class="tabpanel" id="tab-channels">
+    <h2>Map a sensor to a Modbus channel</h2>
+    <form id="form-channel">
+      <input type="hidden" id="channel-id" />
+      <div class="row">
+        <div class="field">
+          <label for="channel-device">Device (e.g. a UC100/UC300)</label>
+          <select id="channel-device" required></select>
+        </div>
+        <div class="field">
+          <label for="channel-bus-type">Bus type</label>
+          <select id="channel-bus-type">
+            <option value="modbus_rs485">modbus_rs485</option>
+            <option value="modbus_rs232">modbus_rs232</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="channel-sensor">Sensor</label>
+          <select id="channel-sensor" required></select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field narrow">
+          <label for="channel-num">Modbus channel</label>
+          <input type="number" id="channel-num" min="1" required />
+        </div>
+        <div class="field narrow">
+          <label for="channel-slave">Modbus slave ID</label>
+          <input type="number" id="channel-slave" min="1" required />
+        </div>
+      </div>
+      <p class="note">A device can have more than one bus (e.g. RS485 <em>and</em> RS232 simultaneously) — each bus has its own independent channel/slave address space, so the same channel+slave numbers on different buses of the same device don't collide.</p>
+      <div class="row">
+        <button type="submit" id="channel-submit">Create mapping</button>
+        <button type="button" class="secondary" id="channel-cancel">Cancel edit</button>
+      </div>
+    </form>
+    <h2 style="margin-top:1.5rem">Existing channel mappings</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Device</th><th>Bus</th><th>Channel</th><th>Slave</th><th>Sensor</th><th></th></tr></thead>
+      <tbody id="channels-body"></tbody>
+    </table></div>
+  </section>
+
+  <footer>Reads (lists above) work without a token. Creating or editing anything requires the write token above — see README.md's "Registry (Postgres)" section for the full design.</footer>
+</main>
+
+<script>
+const API_BASE = "/api/registry/v0.1";
+const TOKEN_KEY = "registryWriteToken";
+let token = sessionStorage.getItem(TOKEN_KEY) || "";
+
+let assetsList = [], devicesList = [], sensorsList = [], channelsList = [];
+
+const el = (id) => document.getElementById(id);
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+function showStatus(message, kind) {
+  el("status").innerHTML = `<div class="msg ${kind}">${escapeHtml(message)}</div>`;
+}
+function clearStatus() { el("status").innerHTML = ""; }
+
+async function apiFetch(path, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`);
+  return body;
+}
+
+// ── tabs ──────────────────────────────────────────────────────────────────────────────
+for (const btn of document.querySelectorAll(".tabs button")) {
+  btn.addEventListener("click", () => {
+    for (const b of document.querySelectorAll(".tabs button")) b.classList.toggle("active", b === btn);
+    for (const p of document.querySelectorAll(".tabpanel")) p.classList.toggle("active", p.id === `tab-${btn.dataset.tab}`);
+  });
+}
+
+// ── token ─────────────────────────────────────────────────────────────────────────────
+el("token").value = token;
+el("saveToken").addEventListener("click", () => {
+  token = el("token").value.trim();
+  sessionStorage.setItem(TOKEN_KEY, token);
+  showStatus("Token saved for this tab.", "ok");
+});
+
+// ── load everything ───────────────────────────────────────────────────────────────────
+async function loadAll() {
+  [assetsList, devicesList, sensorsList, channelsList] = await Promise.all([
+    apiFetch("/assets"),
+    apiFetch("/devices"),
+    apiFetch("/sensors"),
+    apiFetch("/modbus-channels"),
+  ]);
+  renderAssets();
+  renderDevices();
+  renderSensors();
+  renderChannels();
+  populateDropdowns();
+}
+
+function populateDropdowns() {
+  const assetOptions = (includeNone) =>
+    (includeNone ? '<option value="">— none —</option>' : "") +
+    assetsList.map((a) => `<option value="${a.id}">${escapeHtml(a.asset_name)} (${escapeHtml(a.asset_slug)})</option>`).join("");
+  el("asset-parent").innerHTML = '<option value="">— none —</option>' + assetOptions(false);
+  el("device-asset").innerHTML = assetOptions(true);
+  el("sensor-asset").innerHTML = '<option value="">— inherit from device —</option>' + assetOptions(false);
+
+  const deviceLabel = (d) => `${escapeHtml(d.device_model)} · ${escapeHtml(d.dev_eui || d.mac_address || d.id.slice(0, 8))}`;
+  const deviceOptions = devicesList.map((d) => `<option value="${d.id}">${deviceLabel(d)}</option>`).join("");
+  el("sensor-device").innerHTML = deviceOptions;
+  el("channel-device").innerHTML = deviceOptions;
+
+  const sensorLabel = (s) => `${escapeHtml(s.sensor_name || s.sensor_type)} (${escapeHtml(s.id.slice(0, 8))})`;
+  el("channel-sensor").innerHTML = sensorsList.map((s) => `<option value="${s.id}">${sensorLabel(s)}</option>`).join("");
+}
+
+// ── assets ────────────────────────────────────────────────────────────────────────────
+function renderAssets() {
+  const byId = new Map(assetsList.map((a) => [a.id, a]));
+  el("assets-body").innerHTML = assetsList
+    .map((a) => {
+      const attached = devicesList.filter((d) => d.asset_id === a.id);
+      const parent = a.parent_asset_id ? byId.get(a.parent_asset_id) : undefined;
+      const deviceOptionsForAttach = devicesList
+        .filter((d) => d.asset_id !== a.id)
+        .map((d) => `<option value="${d.id}">${escapeHtml(d.device_model)} · ${escapeHtml(d.dev_eui || d.mac_address || d.id.slice(0, 8))}</option>`)
+        .join("");
+      return `
+      <tr data-asset-id="${a.id}">
+        <td>${escapeHtml(a.asset_name)}</td>
+        <td class="mono">${escapeHtml(a.asset_slug)}</td>
+        <td>${parent ? escapeHtml(parent.asset_name) : '<span class="muted">—</span>'}</td>
+        <td>${attached.length ? attached.map((d) => escapeHtml(d.device_model)).join(", ") : '<span class="muted">none</span>'}</td>
+        <td>
+          <select class="attach-device-select" style="min-width:140px">
+            <option value="">choose device…</option>
+            ${deviceOptionsForAttach}
+          </select>
+          <button type="button" class="secondary attach-device-btn">Attach</button>
+        </td>
+        <td><button type="button" class="secondary edit-asset-btn">Edit</button></td>
+      </tr>`;
+    })
+    .join("");
+
+  el("assets-body").querySelectorAll(".edit-asset-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const id = e.target.closest("tr").dataset.asset_id;
+      const a = assetsList.find((x) => x.id === id);
+      el("asset-id").value = a.id;
+      el("asset-name").value = a.asset_name;
+      el("asset-slug").value = a.asset_slug;
+      el("asset-parent").value = a.parent_asset_id || "";
+      el("asset-submit").textContent = "Save changes";
+      document.querySelector('.tabs button[data-tab="assets"]').click();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  });
+  el("assets-body").querySelectorAll(".attach-device-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const row = e.target.closest("tr");
+      const asset_id = row.dataset.asset_id;
+      const device_id = row.querySelector(".attach-device-select").value;
+      if (!device_id) return;
+      try {
+        await apiFetch(`/devices/${device_id}`, { method: "PATCH", body: JSON.stringify({ asset_id }) });
+        showStatus("Device attached.", "ok");
+        await loadAll();
+      } catch (err) {
+        showStatus(String(err.message || err), "error");
+      }
+    });
+  });
+}
+
+el("asset-cancel").addEventListener("click", () => resetAssetForm());
+function resetAssetForm() {
+  el("form-asset").reset();
+  el("asset-id").value = "";
+  el("asset-submit").textContent = "Create asset";
+}
+
+el("form-asset").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearStatus();
+  const id = el("asset-id").value;
+  const body = {
+    asset_name: el("asset-name").value.trim(),
+    asset_slug: el("asset-slug").value.trim(),
+    parent_asset_id: el("asset-parent").value || null,
+  };
+  try {
+    if (id) {
+      await apiFetch(`/assets/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+      showStatus("Asset updated.", "ok");
+    } else {
+      await apiFetch("/assets", { method: "POST", body: JSON.stringify(body) });
+      showStatus("Asset created.", "ok");
+    }
+    resetAssetForm();
+    await loadAll();
+  } catch (err) {
+    showStatus(String(err.message || err), "error");
+  }
+});
+
+// ── devices ───────────────────────────────────────────────────────────────────────────
+function renderDevices() {
+  const assetById = new Map(assetsList.map((a) => [a.id, a]));
+  el("devices-body").innerHTML = devicesList
+    .map((d) => {
+      const asset = d.asset_id ? assetById.get(d.asset_id) : undefined;
+      return `
+      <tr data-device-id="${d.id}">
+        <td>${escapeHtml(d.device_model)}</td>
+        <td>${escapeHtml(d.device_type)}</td>
+        <td class="mono">${escapeHtml(d.dev_eui || d.mac_address || "—")}</td>
+        <td>${asset ? escapeHtml(asset.asset_name) : '<span class="muted">none</span>'}</td>
+        <td><button type="button" class="secondary edit-device-btn">Edit</button></td>
+      </tr>`;
+    })
+    .join("");
+
+  el("devices-body").querySelectorAll(".edit-device-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const id = e.target.closest("tr").dataset.device_id;
+      const d = devicesList.find((x) => x.id === id);
+      el("device-id").value = d.id;
+      el("device-model").value = d.device_model;
+      el("device-type").value = d.device_type;
+      el("device-serial").value = d.serial_number || "";
+      el("device-eui").value = d.dev_eui || "";
+      el("device-mac").value = d.mac_address || "";
+      el("device-asset").value = d.asset_id || "";
+      el("device-submit").textContent = "Save changes";
+      document.querySelector('.tabs button[data-tab="devices"]').click();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  });
+}
+
+el("device-cancel").addEventListener("click", () => resetDeviceForm());
+function resetDeviceForm() {
+  el("form-device").reset();
+  el("device-id").value = "";
+  el("device-submit").textContent = "Create device";
+}
+
+el("form-device").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearStatus();
+  const id = el("device-id").value;
+  const body = {
+    device_model: el("device-model").value.trim(),
+    device_type: el("device-type").value,
+    serial_number: el("device-serial").value.trim() || null,
+    dev_eui: el("device-eui").value.trim() || null,
+    mac_address: el("device-mac").value.trim() || null,
+    asset_id: el("device-asset").value || null,
+  };
+  try {
+    if (id) {
+      await apiFetch(`/devices/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+      showStatus("Device updated.", "ok");
+    } else {
+      await apiFetch("/devices", { method: "POST", body: JSON.stringify(body) });
+      showStatus("Device created.", "ok");
+    }
+    resetDeviceForm();
+    await loadAll();
+  } catch (err) {
+    showStatus(String(err.message || err), "error");
+  }
+});
+
+// ── sensors ───────────────────────────────────────────────────────────────────────────
+function renderSensors() {
+  const deviceById = new Map(devicesList.map((d) => [d.id, d]));
+  const assetById = new Map(assetsList.map((a) => [a.id, a]));
+  el("sensors-body").innerHTML = sensorsList
+    .map((s) => {
+      const device = deviceById.get(s.device_id);
+      const assetOverride = s.asset_id ? assetById.get(s.asset_id) : undefined;
+      return `
+      <tr data-sensor-id="${s.id}">
+        <td>${escapeHtml(s.sensor_type)}</td>
+        <td>${escapeHtml(s.sensor_name || "—")}</td>
+        <td>${device ? escapeHtml(device.device_model) : '<span class="muted">unknown</span>'}</td>
+        <td>${assetOverride ? escapeHtml(assetOverride.asset_name) : '<span class="muted">inherits device</span>'}</td>
+        <td><button type="button" class="secondary edit-sensor-btn">Edit</button></td>
+      </tr>`;
+    })
+    .join("");
+
+  el("sensors-body").querySelectorAll(".edit-sensor-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const id = e.target.closest("tr").dataset.sensor_id;
+      const s = sensorsList.find((x) => x.id === id);
+      el("sensor-id").value = s.id;
+      el("sensor-type").value = s.sensor_type;
+      el("sensor-device").value = s.device_id;
+      el("sensor-index").value = s.device_index ?? "";
+      el("sensor-name").value = s.sensor_name || "";
+      el("sensor-asset").value = s.asset_id || "";
+      el("sensor-submit").textContent = "Save changes";
+      document.querySelector('.tabs button[data-tab="sensors"]').click();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  });
+}
+
+el("sensor-cancel").addEventListener("click", () => resetSensorForm());
+function resetSensorForm() {
+  el("form-sensor").reset();
+  el("sensor-id").value = "";
+  el("sensor-submit").textContent = "Create sensor";
+}
+
+el("form-sensor").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearStatus();
+  const id = el("sensor-id").value;
+  const body = {
+    sensor_type: el("sensor-type").value.trim(),
+    device_id: el("sensor-device").value,
+    device_index: el("sensor-index").value ? Number(el("sensor-index").value) : null,
+    sensor_name: el("sensor-name").value.trim() || null,
+    asset_id: el("sensor-asset").value || null,
+  };
+  try {
+    if (id) {
+      await apiFetch(`/sensors/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+      showStatus("Sensor updated.", "ok");
+    } else {
+      await apiFetch("/sensors", { method: "POST", body: JSON.stringify(body) });
+      showStatus("Sensor created.", "ok");
+    }
+    resetSensorForm();
+    await loadAll();
+  } catch (err) {
+    showStatus(String(err.message || err), "error");
+  }
+});
+
+// ── modbus channels ──────────────────────────────────────────────────────────────────
+function renderChannels() {
+  const deviceById = new Map(devicesList.map((d) => [d.id, d]));
+  const sensorById = new Map(sensorsList.map((s) => [s.id, s]));
+  el("channels-body").innerHTML = channelsList
+    .map((c) => {
+      const device = deviceById.get(c.device_id);
+      const sensor = sensorById.get(c.sensor_id);
+      return `
+      <tr data-channel-id="${c.id}">
+        <td>${device ? escapeHtml(device.device_model) : '<span class="muted">unknown</span>'}</td>
+        <td class="mono">${escapeHtml(c.bus_type)}</td>
+        <td>${c.modbus_channel}</td>
+        <td>${c.modbus_slave_id}</td>
+        <td>${sensor ? escapeHtml(sensor.sensor_name || sensor.sensor_type) : '<span class="muted">unknown</span>'}</td>
+        <td><button type="button" class="secondary edit-channel-btn">Edit</button></td>
+      </tr>`;
+    })
+    .join("");
+
+  el("channels-body").querySelectorAll(".edit-channel-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const id = e.target.closest("tr").dataset.channelId;
+      const c = channelsList.find((x) => x.id === id);
+      el("channel-id").value = c.id;
+      el("channel-device").value = c.device_id;
+      el("channel-bus-type").value = c.bus_type;
+      el("channel-sensor").value = c.sensor_id;
+      el("channel-num").value = c.modbus_channel;
+      el("channel-slave").value = c.modbus_slave_id;
+      el("channel-submit").textContent = "Save changes";
+      document.querySelector('.tabs button[data-tab="channels"]').click();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  });
+}
+
+el("channel-cancel").addEventListener("click", () => resetChannelForm());
+function resetChannelForm() {
+  el("form-channel").reset();
+  el("channel-id").value = "";
+  el("channel-submit").textContent = "Create mapping";
+}
+
+el("form-channel").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearStatus();
+  const id = el("channel-id").value;
+  try {
+    if (id) {
+      // device/bus_type/sensor are fixed at creation time — only the channel/slave numbers can
+      // change, matching what PATCH /modbus-channels/:id actually accepts server-side.
+      await apiFetch(`/modbus-channels/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ modbus_channel: Number(el("channel-num").value), modbus_slave_id: Number(el("channel-slave").value) }),
+      });
+      showStatus("Channel mapping updated.", "ok");
+    } else {
+      await apiFetch("/modbus-channels", {
+        method: "POST",
+        body: JSON.stringify({
+          device_id: el("channel-device").value,
+          bus_type: el("channel-bus-type").value,
+          sensor_id: el("channel-sensor").value,
+          modbus_channel: Number(el("channel-num").value),
+          modbus_slave_id: Number(el("channel-slave").value),
+        }),
+      });
+      showStatus("Channel mapping created.", "ok");
+    }
+    resetChannelForm();
+    await loadAll();
+  } catch (err) {
+    showStatus(String(err.message || err), "error");
+  }
+});
+
+loadAll().catch((err) => showStatus(String(err.message || err), "error"));
+</script>
+</body>
+</html>

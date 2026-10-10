@@ -2,6 +2,7 @@ import { Elysia } from "elysia";
 import { openapi } from "@elysiajs/openapi";
 import { config } from "./config";
 import { timeseries } from "./routes/timeseries";
+import { registry } from "./routes/registry";
 
 const app = new Elysia()
   // Static, dependency-free query builder UI — reads /api/timeseries/:version/_meta at load time
@@ -17,6 +18,9 @@ const app = new Elysia()
   // address. /api itself 301s here so nothing that bookmarked the old location breaks.
   .get("/api", ({ redirect }) => redirect("/api/timeseries", 301))
   .get("/api/timeseries", () => Bun.file("src/public/index.html"))
+  // Device/asset/sensor/bus registry UI — same dependency-free static-page pattern as the query
+  // builder above, reading/writing /api/registry/v0.1/... (src/routes/registry.ts).
+  .get("/api/registry", () => Bun.file("src/public/registry.html"))
   // Liveness: process is up and can handle HTTP — no external dependency check. A k8s liveness
   // probe should never depend on InfluxDB being reachable; if it did, a transient InfluxDB blip
   // would make every replica fail liveness simultaneously and get restarted in a loop, turning a
@@ -35,6 +39,7 @@ const app = new Elysia()
     return { status: "ok", orgs: orgCount };
   })
   .use(timeseries)
+  .use(registry)
   .use(
     openapi({
       // Same /api-prefix reasoning as the query builder UI above — the default /openapi path

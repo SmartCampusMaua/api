@@ -3,7 +3,7 @@ import { zipSync } from "fflate";
 import { config, type OrgTarget } from "../config";
 import { InfluxDBError, querySql, queryRaw, columnExists, type InfluxRow } from "../influxdb";
 import { withMemoryCache, withDiskCache, buildCacheKey, rangeTtlMs } from "../cache";
-import { sensorRegistry, resolveSensorId } from "../sensors";
+import { sensorRegistry, resolveSensorId, sensorsByDeviceId, sensorsByAssetId, sensorsByAssetSlug } from "../sensors";
 
 // Each :org routes to a distinct InfluxDB instance (its own host + token) — this is the API's
 // own multi-instance registry, configured via influxdb.json in src/config.ts. It's unrelated
@@ -371,6 +371,25 @@ function resolveFilter(table: string, query: TimeseriesQuery, sensorIdAvailable:
   return { ok: true, table, config, whereTags, tagBindParams, startNs: range.startNs, endNs: range.endNs, chunks, limit, sensorIdAvailable, assetIdAvailable };
 }
 
+// Translates ?assetSlug= into the equivalent ?assetId= before resolveFilter runs, since InfluxDB
+// itself only ever has asset_id as a real tag — asset_slug is a registry-only concept (see
+// src/sensors.ts) that never reaches a SQL query directly. Merges with any assetId already given
+// (union, not AND) rather than making the caller pick one or the other, since both are just
+// different ways of saying "this asset." If assetIdAvailable turns out to be false, resolveFilter
+// still rejects this with a 400 — the message just names "assetId" rather than "assetSlug" in
+// that case, a minor wording rough edge not worth extra plumbing for right now.
+function resolveAssetSlugFilter(query: TimeseriesQuery): TimeseriesQuery {
+  if (query.assetSlug === undefined) return query;
+  const slugs = query.assetSlug.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  const resolvedIds = slugs.flatMap((slug) => sensorsByAssetSlug(slug).map((s) => s.asset_id)).filter((id): id is string => !!id);
+  const existingIds = query.assetId ? query.assetId.split(",").map((s) => s.trim()).filter((s) => s.length > 0) : [];
+  const merged = [...new Set([...existingIds, ...resolvedIds])];
+  // A given assetSlug that matches nothing must still narrow to zero rows, not silently fall back
+  // to "no assetId filter at all" — force a value that can never equal a real asset_id.
+  const assetId = merged.length > 0 ? merged.join(",") : "__no-assetSlug-match__";
+  return { ...query, assetId };
+}
+
 // Maps an InfluxDB "file scan limit" planning error to a 400 the caller can act on
 // (narrow the query), as opposed to a generic 502 for unrelated upstream failures.
 function toErrorResponse(err: unknown, set: { status?: number | string }, tags: readonly string[]) {
@@ -488,6 +507,9 @@ const filterQuerySchema = t.Object({
   // Only meaningful on the base/series route (see OPTIONAL_SERIES_FIELDS above) — /export ignores
   // it, since export is a raw SELECT * passthrough with no per-field shaping to opt in/out of.
   fields: t.Optional(t.String()),
+  // Not a real InfluxDB tag (unlike everything in ALL_TAGS below) — resolved into the equivalent
+  // assetId via resolveAssetSlugFilter() before filter resolution runs. See src/sensors.ts.
+  assetSlug: t.Optional(t.String()),
   ...Object.fromEntries(ALL_TAGS.map((tag) => [tag, t.Optional(t.String())])),
 });
 
@@ -523,7 +545,7 @@ export const timeseries = new Elysia()
         return toErrorResponse(err, set, TABLES[table]?.tags ?? []);
       }
 
-      const resolved = resolveFilter(table, query, sensorIdAvailable, assetIdAvailable);
+      const resolved = resolveFilter(table, resolveAssetSlugFilter(query), sensorIdAvailable, assetIdAvailable);
       if (!resolved.ok) {
         set.status = resolved.status;
         return { error: resolved.error };
@@ -652,7 +674,7 @@ export const timeseries = new Elysia()
         return toErrorResponse(err, set, TABLES[table]?.tags ?? []);
       }
 
-      const resolved = resolveFilter(table, query, sensorIdAvailable, assetIdAvailable);
+      const resolved = resolveFilter(table, resolveAssetSlugFilter(query), sensorIdAvailable, assetIdAvailable);
       if (!resolved.ok) {
         set.status = resolved.status;
         return { error: resolved.error };
@@ -706,7 +728,7 @@ export const timeseries = new Elysia()
   )
   .get(
     "/api/timeseries/v0.4/:org/sensors",
-    ({ params, set }) => {
+    ({ params, query, set }) => {
       const org = resolveOrg(params.org);
       if (!org.ok) {
         set.status = org.status;
@@ -716,14 +738,37 @@ export const timeseries = new Elysia()
         set.status = 502;
         return { error: `Sensor registry unavailable: ${sensorRegistry.error}` };
       }
-      return sensorRegistry.list;
+
+      let result = sensorRegistry.list;
+      // Comma-separated multi-value per filter (OR within one filter), AND between deviceId and
+      // the asset filters when combined — same convention as every tag filter on the main routes.
+      // assetId and assetSlug narrow the same "asset" dimension (two spellings of the same thing),
+      // so they union together rather than AND — same reasoning as resolveAssetSlugFilter below.
+      // An id/slug with no match is a normal empty result, not an error: this is a static registry
+      // filter, not a live-schema check like the main routes' ?sensorId= gate.
+      if (query.deviceId !== undefined) {
+        const ids = query.deviceId.split(",").map((v) => v.trim()).filter((v) => v.length > 0);
+        const matched = new Set(ids.flatMap((id) => sensorsByDeviceId(id).map((s) => s.sensor_id)));
+        result = result.filter((s) => matched.has(s.sensor_id));
+      }
+      if (query.assetId !== undefined || query.assetSlug !== undefined) {
+        const ids = query.assetId ? query.assetId.split(",").map((v) => v.trim()).filter((v) => v.length > 0) : [];
+        const slugs = query.assetSlug ? query.assetSlug.split(",").map((v) => v.trim()).filter((v) => v.length > 0) : [];
+        const matched = new Set([
+          ...ids.flatMap((id) => sensorsByAssetId(id).map((s) => s.sensor_id)),
+          ...slugs.flatMap((slug) => sensorsByAssetSlug(slug).map((s) => s.sensor_id)),
+        ]);
+        result = result.filter((s) => matched.has(s.sensor_id));
+      }
+      return result;
     },
     {
       params: t.Object({ org: t.String() }),
+      query: t.Object({ deviceId: t.Optional(t.String()), assetId: t.Optional(t.String()), assetSlug: t.Optional(t.String()) }),
       detail: {
         summary: "Sensor + device + asset registry (for building a sensor picker)",
         description:
-          "Flat list of {sensor_id, sensor_type, sensor_name?, device_id, device_model?, dev_eui?, mac_address?, asset_id?}, joined from parse-mqtt-to-influxdb3's sensors.json + devices.json + assets.json — the canonical source sensor_id is assigned from, not derived from InfluxDB itself. Currently the same list regardless of :org (only used for its existence check); 502 if the registry files aren't readable. `sensor_name` is only present on the small number of sensors that actually need a human label to disambiguate (e.g. multiple probes on one device) — fall back to `sensor_type` otherwise. `asset_id` is only present for devices actually assigned to an asset in assets.json — most aren't yet.",
+          "Flat list of {sensor_id, sensor_type, sensor_name?, device_id, device_model?, dev_eui?, mac_address?, asset_id?, asset_name?, asset_slug?}, joined from parse-mqtt-to-influxdb3's sensors.json + devices.json + assets.json — the canonical source sensor_id is assigned from, not derived from InfluxDB itself. Currently the same list regardless of :org (only used for its existence check); 502 if the registry files aren't readable. `sensor_name` is only present on the small number of sensors that actually need a human label to disambiguate (e.g. multiple probes on one device) — fall back to `sensor_type` otherwise. `asset_id`/`asset_name`/`asset_slug` are only present for devices actually assigned to an asset in assets.json — most aren't yet. `asset_slug` is the stable, lowercase-kebab-case filter key; `asset_name` is a free-text display label with no filtering role. Optional `?deviceId=`/`?assetId=`/`?assetSlug=` narrow the list (index-backed, not a linear scan — see src/sensors.ts), each accepting a comma-separated list (OR'd); `assetId` and `assetSlug` union together (two spellings of the same filter), combined with AND against `deviceId` when given. An id/slug with no match just returns fewer results, not a 400.",
         tags: ["timeseries"],
       },
     }
@@ -747,6 +792,56 @@ export const timeseries = new Elysia()
 // glob/multi-file dataset API, so nothing needs to be merged/re-encoded to use it. zipSync uses
 // level:0 (store, no compression): Parquet's column chunks are already Snappy/Zstd-compressed
 // internally, so compressing the zip container on top buys close to nothing and just costs CPU.
+// Floor for bisecting a single write-dense day (see fetchParquetPieces below). Matches InfluxDB3
+// Core's default gen1-duration (10m): a sub-window entirely inside one gen1 bucket overlaps the
+// same set of files as any other sub-window inside that bucket (confirmed by direct inspection —
+// see the write-fragmentation investigation in README/git history), so bisecting any finer can't
+// reduce the file count a query has to scan. A failure that survives all the way down to this
+// floor is treated as a real error rather than chunked away further.
+const MIN_PARQUET_SUBCHUNK_MS = 10 * 60 * 1000;
+
+function hhmm(ns: bigint): string {
+  return new Date(Number(ns / 1_000_000n)).toISOString().slice(11, 16).replace(":", "");
+}
+
+type ParquetPiece = { startNs: bigint; endNs: bigint; bytes: Uint8Array };
+
+// Fetches one day-chunk's Parquet bytes; on InfluxDB3's file-scan-limit error, bisects the range
+// in half and retries each half independently (recursively), rather than letting one write-dense
+// day abort the entire multi-day export — see toErrorResponse's "exceeding the file limit" case,
+// and the production incident this generalizes from (a single day dense enough to trip the cap
+// even under a narrow tag filter). Each half is cached under its own startNs/endNs exactly like a
+// whole day already is (buildCacheKey takes the exact range, not "which day"), so this costs
+// nothing extra on a subsequent identical request. Returns one piece per successful leaf; a day
+// that didn't need bisecting returns exactly one piece spanning the whole requested range.
+async function fetchParquetPieces(
+  startNs: bigint,
+  endNs: bigint,
+  limit: number,
+  selectExtra: string,
+  buildQuery: (startNs: bigint, endNs: bigint, limit: number) => { sql: string; bindParams: Record<string, string> },
+  exportCacheKey: (kind: string, startNs: bigint, endNs: bigint) => string,
+  database: string,
+  target: OrgTarget
+): Promise<ParquetPiece[]> {
+  const { sql, bindParams } = buildQuery(startNs, endNs, limit);
+  const cacheKey = exportCacheKey(`export-parquet-day:devtype=${!!selectExtra}:limit=${limit}`, startNs, endNs);
+  try {
+    const bytes = await withDiskCache(cacheKey, rangeTtlMs(endNs), () => queryRaw(sql, "parquet", bindParams, database, target));
+    return bytes.byteLength === 0 ? [] : [{ startNs, endNs, bytes: new Uint8Array(bytes) }];
+  } catch (err) {
+    const tooWide = err instanceof InfluxDBError && err.message.includes("exceeding the file limit");
+    const spanMs = Number((endNs - startNs) / 1_000_000n);
+    if (!tooWide || spanMs <= MIN_PARQUET_SUBCHUNK_MS) throw err;
+    const midNs = startNs + (endNs - startNs) / 2n;
+    const [first, second] = await Promise.all([
+      fetchParquetPieces(startNs, midNs, limit, selectExtra, buildQuery, exportCacheKey, database, target),
+      fetchParquetPieces(midNs, endNs, limit, selectExtra, buildQuery, exportCacheKey, database, target),
+    ]);
+    return [...first, ...second];
+  }
+}
+
 async function queryExportBytes(
   resolved: Extract<ResolvedFilter, { ok: true }>,
   format: ExportFormat,
@@ -783,12 +878,18 @@ async function queryExportBytes(
     // hit the same day with a *different* limit value miss each other, which is rarer.
     const entries: Record<string, [Uint8Array, { level: 0 }]> = {};
     for (const chunk of resolved.chunks) {
-      const { sql, bindParams } = buildQuery(chunk.startNs, chunk.endNs, resolved.limit);
-      const cacheKey = exportCacheKey(`export-parquet-day:devtype=${!!selectExtra}:limit=${resolved.limit}`, chunk.startNs, chunk.endNs);
-      const bytes = await withDiskCache(cacheKey, rangeTtlMs(chunk.endNs), () => queryRaw(sql, format, bindParams, database, target));
-      if (bytes.byteLength === 0) continue; // no rows matched this day — skip rather than bundle an empty file
+      const pieces = await fetchParquetPieces(chunk.startNs, chunk.endNs, resolved.limit, selectExtra, buildQuery, exportCacheKey, database, target);
       const day = new Date(Number(chunk.startNs / 1_000_000n)).toISOString().slice(0, 10);
-      entries[`${resolved.table}_${day}.parquet`] = [new Uint8Array(bytes), { level: 0 }];
+      if (pieces.length === 1) {
+        entries[`${resolved.table}_${day}.parquet`] = [pieces[0].bytes, { level: 0 }];
+        continue;
+      }
+      // The day had to be bisected (see fetchParquetPieces) — each piece is its own independently
+      // valid Parquet file (same reason whole days are never byte-merged, see the comment atop
+      // queryExportBytes), so every piece gets its own zip entry named by its actual time range.
+      for (const piece of pieces) {
+        entries[`${resolved.table}_${day}_${hhmm(piece.startNs)}-${hhmm(piece.endNs)}.parquet`] = [piece.bytes, { level: 0 }];
+      }
     }
     return zipSync(entries);
   }

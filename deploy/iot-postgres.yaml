@@ -1,0 +1,70 @@
+# Dedicated Postgres for the registry (assets/devices/sensors/device_buses/modbus_channels).
+# Named "iot" for now (db/user/password all "iot") — see README.md "Kubernetes: Postgres
+# StatefulSet for the registry" for the rationale behind each choice here (StatefulSet vs
+# Deployment, headless Service, no HA/backup yet). Rename when this moves to the official
+# zc8 project: metadata.name, POSTGRES_DB/USER, and whatever connects via DATABASE_URL all
+# need to change together — there's no alias layer here.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: iot-postgres-credentials
+type: Opaque
+stringData:
+  POSTGRES_USER: iot
+  POSTGRES_PASSWORD: iot
+  POSTGRES_DB: iot
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iot-postgres
+spec:
+  # Headless (no clusterIP) — StatefulSet requires this via `serviceName` below. Reach it at
+  # iot-postgres:5432 from inside the cluster, or iot-postgres-0.iot-postgres.<namespace>.svc.cluster.local fully qualified.
+  clusterIP: None
+  selector: { app: iot-postgres }
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: iot-postgres
+spec:
+  serviceName: iot-postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: iot-postgres }
+  template:
+    metadata:
+      labels: { app: iot-postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef: { name: iot-postgres-credentials }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "iot", "-d", "iot"] }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "iot", "-d", "iot"] }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: rook-ceph-block
+        resources:
+          requests: { storage: 5Gi }

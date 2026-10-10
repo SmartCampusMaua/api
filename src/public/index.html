@@ -273,7 +273,7 @@ function renderTags() {
   const rm = currentResourceMeta();
   const container = el("tags");
   if (!rm) { container.innerHTML = ""; return; }
-  container.innerHTML = rm.tags
+  const tagFields = rm.tags
     .map((tag) =>
       tag === "sensorId"
         ? `
@@ -290,6 +290,18 @@ function renderTags() {
       </div>`
     )
     .join("");
+  // assetSlug isn't a real InfluxDB tag (unlike everything in rm.tags from _meta) — it's resolved
+  // to the equivalent assetId server-side before the query runs (resolveAssetSlugFilter), so it's
+  // appended here directly rather than being listed by _meta. Only offered alongside assetId
+  // itself, since it's meaningless where assetId isn't (e.g. iot/audit).
+  const assetSlugField = rm.tags.includes("assetId")
+    ? `
+      <div class="field">
+        <label for="tag-assetSlug">assetSlug</label>
+        <input type="text" id="tag-assetSlug" data-tag="assetSlug" placeholder="e.g. asset-1" />
+      </div>`
+    : "";
+  container.innerHTML = tagFields + assetSlugField;
   renderSensorPicker();
 }
 
