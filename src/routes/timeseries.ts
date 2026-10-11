@@ -6,7 +6,7 @@ import { withMemoryCache, withDiskCache, buildCacheKey, rangeTtlMs } from "../ca
 import { sensorRegistry, resolveSensorId, sensorsByDeviceId, sensorsByAssetId, sensorsByAssetSlug } from "../sensors";
 
 // Each :org routes to a distinct InfluxDB instance (its own host + token) — this is the API's
-// own multi-instance registry, configured via influxdb.json in src/config.ts. It's unrelated
+// own multi-instance registry, configured via infra.json in src/config.ts. It's unrelated
 // to InfluxDB3 Core's own org concept, which doesn't exist (see README.md). Org slugs are
 // always lowercase, so the incoming URL segment is normalized before lookup — "IMT" and "imt"
 // resolve the same way.

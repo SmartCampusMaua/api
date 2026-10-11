@@ -8,7 +8,7 @@ const app = new Elysia()
   // Static, dependency-free query builder UI — reads /api/timeseries/:version/_meta at load time
   // to build its form from the live org/domain/resource/tags registry rather than a hardcoded
   // copy, and offers a version picker so it keeps working once a v0.5+ exists alongside v0.4.
-  // Path is relative to CWD (same convention as config.ts's influxdb.json path) rather than
+  // Path is relative to CWD (same convention as config.ts's infra.json path) rather than
   // import.meta.dir, since the latter needs ESM module output and this project's tsconfig
   // resolves module format from package.json's absent "type" field as CommonJS.
   //
@@ -27,7 +27,7 @@ const app = new Elysia()
   // partial upstream outage into a full self-inflicted one.
   .get("/healthz", () => ({ status: "ok" }))
   // Readiness: config actually loaded successfully (src/config.ts crashes the process on a bad
-  // initial influxdb.json, so this only meaningfully differs from "always ready" in the narrow
+  // initial infra.json, so this only meaningfully differs from "always ready" in the narrow
   // window before that first load completes). Deliberately still doesn't touch InfluxDB itself,
   // for the same cascading-failure reason as above.
   .get("/readyz", ({ set }) => {

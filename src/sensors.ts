@@ -4,10 +4,10 @@
 // and parse-mqtt-to-influxdb3 are checked out side by side on the same machine, which is true
 // for local dev but not for a deployed image (there's no sibling checkout inside a Docker
 // container). Once both files are made available to this service properly (a shared registry
-// service, or mirrored/mounted the way influxdb.json is), swap the paths below for that — no
+// service, or mirrored/mounted the way infra.json is), swap the paths below for that — no
 // other code here needs to change, since everything downstream only depends on `sensorRegistry`.
 //
-// Unlike config.ts's influxdb.json, a bad/missing file here does NOT crash the process: this
+// Unlike config.ts's infra.json, a bad/missing file here does NOT crash the process: this
 // registry is a convenience for the sensor-picker UI and the /:org/sensors endpoint, not
 // something the core timeseries routes depend on to function. Missing it should degrade that one
 // feature, not take the whole API down.

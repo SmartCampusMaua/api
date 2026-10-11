@@ -5,16 +5,20 @@
 // boot than serve requests with no orgs configured), then re-read on a timer. A reload
 // failure logs and keeps the previous good config rather than wiping it out or crashing —
 // same reasoning as that service's "keep the last known-good" comment for its own registry.
+//
+// infra.json is broader than this API's own needs (it also holds an "mqtt" broker block, for
+// other services) — this only ever reads the "influxdb" key, ignoring the rest, so other
+// sections can be added/edited without this process caring.
 
 import { readFileSync } from "fs";
 
 export type OrgTarget = { host: string; token: string };
 
 type OrgEntry = { org: string; host: string; token: string; allow?: boolean };
-type OrgsFile = { version?: string; orgs: OrgEntry[] };
+type InfraFile = { version?: string; influxdb: { orgs: OrgEntry[] } };
 
-const CONFIG_FILE = process.env.INFLUXDB_CONFIG_FILE ?? "influxdb.json";
-const REFRESH_SEC = Number(process.env.INFLUXDB_CONFIG_REFRESH_SEC) || 30;
+const CONFIG_FILE = process.env.INFRA_CONFIG_FILE ?? "infra.json";
+const REFRESH_SEC = Number(process.env.INFRA_CONFIG_REFRESH_SEC) || 30;
 
 function parseOrgsFile(path: string): Record<string, OrgTarget> {
   let raw: string;
@@ -24,27 +28,27 @@ function parseOrgsFile(path: string): Record<string, OrgTarget> {
     throw new Error(`read ${path}: ${err instanceof Error ? err.message : err}`);
   }
 
-  let parsed: OrgsFile;
+  let parsed: InfraFile;
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
     throw new Error(`parse ${path}: ${err instanceof Error ? err.message : err}`);
   }
 
-  if (!Array.isArray(parsed.orgs)) {
-    throw new Error(`${path}: "orgs" must be an array`);
+  if (!Array.isArray(parsed.influxdb?.orgs)) {
+    throw new Error(`${path}: "influxdb.orgs" must be an array`);
   }
 
   const orgs: Record<string, OrgTarget> = {};
-  for (const [i, entry] of parsed.orgs.entries()) {
+  for (const [i, entry] of parsed.influxdb.orgs.entries()) {
     if (entry.allow === false) continue;
-    if (!entry.org) throw new Error(`${path}: orgs[${i}] is missing "org"`);
-    if (!entry.host) throw new Error(`${path}: orgs[${i}] ("${entry.org}") is missing "host"`);
-    if (!entry.token) throw new Error(`${path}: orgs[${i}] ("${entry.org}") is missing "token"`);
+    if (!entry.org) throw new Error(`${path}: influxdb.orgs[${i}] is missing "org"`);
+    if (!entry.host) throw new Error(`${path}: influxdb.orgs[${i}] ("${entry.org}") is missing "host"`);
+    if (!entry.token) throw new Error(`${path}: influxdb.orgs[${i}] ("${entry.org}") is missing "token"`);
     orgs[entry.org.toLowerCase()] = { host: entry.host, token: entry.token };
   }
   if (Object.keys(orgs).length === 0) {
-    throw new Error(`${path}: no enabled orgs (empty "orgs" array, or every entry has "allow": false)`);
+    throw new Error(`${path}: no enabled orgs (empty "influxdb.orgs" array, or every entry has "allow": false)`);
   }
   return orgs;
 }

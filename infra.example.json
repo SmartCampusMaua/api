@@ -1,0 +1,23 @@
+{
+  "version": "1",
+  "influxdb": {
+    "orgs": [
+      {
+        "org": "imt",
+        "host": "http://influxdb.maua.br:8181",
+        "token": ""
+      },
+      {
+        "org": "acme",
+        "host": "http://influxdb.acme.example:8181",
+        "token": "",
+        "allow": false
+      }
+    ]
+  },
+  "mqtt": {
+    "broker": "mqtt.example:1883",
+    "username": "",
+    "password": ""
+  }
+}

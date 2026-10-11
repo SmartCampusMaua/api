@@ -28,9 +28,12 @@ yarn-error.log*
 .env
 .env.local
 
-# org -> InfluxDB instance registry (holds live tokens); influxdb.example.json is the
-# committed, sanitized template. The glob (not just the exact filename) also catches stray
-# backups like influxdb.json.bak, which would otherwise leak a live token just as easily.
+# Infra config (org -> InfluxDB instance registry, mqtt broker credentials — holds live
+# secrets); infra.example.json is the committed, sanitized template. The glob (not just the
+# exact filename) also catches stray backups like infra.json.bak, which would otherwise leak
+# a live token just as easily. influxdb.json* kept ignored too — the now-unused predecessor
+# file, still sitting on disk locally with a real token, not deleted outright.
+infra.json*
 influxdb.json*
 # sensors.json/devices.json/assets.json aren't secret, but they're parse-mqtt-to-influxdb3's data,
 # not this repo's — a local copy at the repo root (for local testing without the sibling checkout)

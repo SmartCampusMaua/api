@@ -39,20 +39,20 @@ COPY --from=install /temp/prod/node_modules node_modules
 COPY --from=typecheck /usr/src/app/src src
 COPY package.json .
 
-# influxdb.json is deliberately NOT copied in (see .dockerignore and the token-security warning
+# infra.json is deliberately NOT copied in (see .dockerignore and the token-security warning
 # in README.md) — same pattern as DEVICE_REGISTRY_FILE in mqtt-topic-rewrite-lns-chirpstackv4's
 # own Dockerfile: a fixed, well-known absolute path baked into the image, with the actual file
 # supplied at runtime (a k8s Secret volume — see README.md's "Docker / Kubernetes" section for
 # why Secret, not ConfigMap, and the subPath gotcha that silently breaks hot-reload). src/config.ts
-# re-reads this path every INFLUXDB_CONFIG_REFRESH_SEC and fails fast at startup if nothing's
-# there, same as running locally with a missing influxdb.json.
-ENV INFLUXDB_CONFIG_FILE=/etc/api/influxdb.json
+# re-reads this path every INFRA_CONFIG_REFRESH_SEC and fails fast at startup if nothing's
+# there, same as running locally with a missing infra.json.
+ENV INFRA_CONFIG_FILE=/etc/api/infra.json
 # sensors.json/devices.json/assets.json follow the exact same pattern, colocated in the same
 # /etc/api directory — src/sensors.ts's default (a relative ../parse-mqtt-to-influxdb3/*.json
 # path) only ever worked for a local checkout sitting next to this repo, never inside a
-# container. Unlike influxdb.json these hold no secrets, but they still live in the same mounted
+# container. Unlike infra.json these hold no secrets, but they still live in the same mounted
 # directory (rather than their own volume) so the whole-directory-mount rule that makes
-# influxdb.json's hot-reload work applies to them too — see the Secret/subPath note above.
+# infra.json's hot-reload work applies to them too — see the Secret/subPath note above.
 ENV SENSORS_CONFIG_FILE=/etc/api/sensors.json
 ENV DEVICES_CONFIG_FILE=/etc/api/devices.json
 ENV ASSETS_CONFIG_FILE=/etc/api/assets.json

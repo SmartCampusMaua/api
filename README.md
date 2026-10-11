@@ -34,37 +34,46 @@ Org slugs are **always lowercase** (`imt`, not `IMT`) — see below.
 
 ## Configuration
 
-### `influxdb.json` — the org → InfluxDB instance registry
+### `infra.json` — the org → InfluxDB instance registry (and other infra config)
 
-Org config lives in `influxdb.json` (gitignored, like `.env`), not environment variables — copy `influxdb.example.json` to `influxdb.json` and fill in real tokens:
+Org config lives in `infra.json` (gitignored, like `.env`), not environment variables — copy `infra.example.json` to `infra.json` and fill in real tokens:
 
 ```json
 {
   "version": "1",
-  "orgs": [
-    { "org": "imt", "host": "http://influxdb.maua.br:8181", "token": "..." }
-  ]
+  "influxdb": {
+    "orgs": [
+      { "org": "imt", "host": "http://influxdb.maua.br:8181", "token": "..." }
+    ]
+  },
+  "mqtt": {
+    "broker": "mqtt.maua.br:1883",
+    "username": "...",
+    "password": "..."
+  }
 }
 ```
 
-| Field          | Required            | Description                                                                                                                       |
-| -------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `orgs[].org`   | yes                 | Org slug, used in the URL and normalized to **lowercase** internally (write it lowercase).                                        |
-| `orgs[].host`  | yes                 | Base URL of that org's InfluxDB instance.                                                                                         |
-| `orgs[].token` | yes                 | Auth token for that org's InfluxDB instance. See warning below.                                                                   |
-| `orgs[].allow` | no (default `true`) | Set to `false` to disable an org without deleting its config/token — the entry is skipped entirely, as if it weren't in the file. |
+`infra.json` is deliberately broader than just this API — it's a shared infrastructure config (InfluxDB org registry here, an `mqtt` broker block for other services) rather than a file scoped to one repo's needs. This API only ever reads the `influxdb` key; everything else (e.g. `mqtt`) is ignored here, present only so other services sharing this file have somewhere to put their own config.
+
+| Field                   | Required            | Description                                                                                                                       |
+| ----------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `influxdb.orgs[].org`   | yes                 | Org slug, used in the URL and normalized to **lowercase** internally (write it lowercase).                                        |
+| `influxdb.orgs[].host`  | yes                 | Base URL of that org's InfluxDB instance.                                                                                         |
+| `influxdb.orgs[].token` | yes                 | Auth token for that org's InfluxDB instance. See warning below.                                                                   |
+| `influxdb.orgs[].allow` | no (default `true`) | Set to `false` to disable an org without deleting its config/token — the entry is skipped entirely, as if it weren't in the file. |
 
 This deliberately mirrors the `devices.json` pattern in [parse-mqtt-to-influxdb3](https://github.com/SmartCampusMaua/parse-mqtt-to-influxdb3/blob/develop/cmd/parse-mqtt-to-influxdb3/main.go) — a JSON registry, not scattered env vars, loaded once at startup and **re-read on a timer** (`src/config.ts`):
 
-- **Startup**: a missing/invalid `influxdb.json` crashes the process immediately (`No orgs configured` or a parse error) — same reasoning as that service's `panic()` on a bad `devices.json`: better to fail loudly at boot than silently serve zero configured orgs.
-- **Reload**: every `INFLUXDB_CONFIG_REFRESH_SEC` seconds (default `30`, override in `.env`), the file is re-read. On success, the new config takes effect immediately — no restart needed, so adding/rotating an org is just editing the file. On failure (bad JSON, missing field), the reload is skipped, the error is logged, and the **previous good config keeps serving** — a typo while hand-editing the file doesn't take the API down, same as that service keeps its last-known-good registry on a bad reload.
-- `INFLUXDB_CONFIG_FILE` (default `influxdb.json`) and `INFLUXDB_CONFIG_REFRESH_SEC` are the only environment variables this API still uses — set them in `.env` if you need non-default values.
+- **Startup**: a missing/invalid `infra.json` (or a missing/malformed `influxdb.orgs` within it) crashes the process immediately (`No orgs configured` or a parse error) — same reasoning as that service's `panic()` on a bad `devices.json`: better to fail loudly at boot than silently serve zero configured orgs.
+- **Reload**: every `INFRA_CONFIG_REFRESH_SEC` seconds (default `30`, override in `.env`), the file is re-read. On success, the new config takes effect immediately — no restart needed, so adding/rotating an org is just editing the file. On failure (bad JSON, missing field), the reload is skipped, the error is logged, and the **previous good config keeps serving** — a typo while hand-editing the file doesn't take the API down, same as that service keeps its last-known-good registry on a bad reload.
+- `INFRA_CONFIG_FILE` (default `infra.json`) and `INFRA_CONFIG_REFRESH_SEC` are the only environment variables this API still uses — set them in `.env` if you need non-default values.
 
 ### Why `:org` is ours, not InfluxDB's
 
 `:org` in every route below selects **which InfluxDB instance** this API talks to — it's this API's own multi-instance routing, for when different customers/campuses each get their own InfluxDB deployment. It is deliberately _not_ InfluxDB's own concept: InfluxDB3 **Core** (confirmed via the server's own `x-influxdb-build: Core` response header) has no org/multi-tenancy of its own — sending an `org` field to its query API is silently accepted and has zero effect (verified). Don't confuse the two: this `:org` never reaches InfluxDB at all, it's resolved entirely on our side into a `{host, token}` pair before any request goes out.
 
-Today only `imt` is registered, pointing at the one InfluxDB instance in use. Onboarding a new org later is just adding an entry to `influxdb.json` — no restart, no code change.
+Today only `imt` is registered, pointing at the one InfluxDB instance in use. Onboarding a new org later is just adding an entry to `infra.json` — no restart, no code change.
 
 ### ⚠️ InfluxDB tokens must stay internal
 
@@ -72,9 +81,9 @@ Every org's InfluxDB token grants direct read access to that org's InfluxDB inst
 
 - Tokens are only ever read server-side, in `src/config.ts` → `src/influxdb.ts`, and attached to the outbound request to InfluxDB as an `Authorization: Bearer` header — keyed by the resolved `:org`, never mixed up between orgs.
 - They're **never** forwarded to, logged for, or readable by API callers — routes only return the transformed sensor readings, never raw upstream request/response details.
-- `influxdb.json` is listed in `.gitignore` — only the placeholder `influxdb.example.json` (no real tokens) is committed.
+- `infra.json` is listed in `.gitignore` — only the placeholder `infra.example.json` (no real tokens) is committed.
 - Don't paste tokens into chat tools, issues, PR descriptions, or logs. Rotate a token in InfluxDB if it's ever leaked.
-- If you deploy this API, mount `influxdb.json` from your host's secret manager (e.g. a Kubernetes Secret volume), not a file baked into the image.
+- If you deploy this API, mount `infra.json` from your host's secret manager (e.g. a Kubernetes Secret volume), not a file baked into the image.
 
 ## Caching (`src/cache.ts`)
 
@@ -168,15 +177,15 @@ bun -e "const t = crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().rep
 docker build -f docker/Dockerfile -t smartcampusmaua/api .
 
 docker run -d -p 3333:3333 \
-  -v "$(pwd)/influxdb.json:/etc/api/influxdb.json:ro" \
+  -v "$(pwd)/infra.json:/etc/api/infra.json:ro" \
   smartcampusmaua/api
 ```
 
-`influxdb.json` is deliberately **not** baked into the image (it's excluded via `.dockerignore`, same token-security reasoning as the warning above) — it must be mounted at runtime. `docker/Dockerfile` sets `ENV INFLUXDB_CONFIG_FILE=/etc/api/influxdb.json`, a fixed absolute path baked into the image (the same pattern this project's sibling Go service, `mqtt-topic-rewrite-lns-chirpstackv4`, already uses for its own `devices.json` via `DEVICE_REGISTRY_FILE`) — so every deployment mounts to the same well-known path rather than needing to know an app-internal working directory.
+`infra.json` is deliberately **not** baked into the image (it's excluded via `.dockerignore`, same token-security reasoning as the warning above) — it must be mounted at runtime. `docker/Dockerfile` sets `ENV INFRA_CONFIG_FILE=/etc/api/infra.json`, a fixed absolute path baked into the image (the same pattern this project's sibling Go service, `mqtt-topic-rewrite-lns-chirpstackv4`, already uses for its own `devices.json` via `DEVICE_REGISTRY_FILE`) — so every deployment mounts to the same well-known path rather than needing to know an app-internal working directory.
 
 ### Kubernetes: config files as a Secret volume
 
-**Use a `Secret`, not a `ConfigMap`, for this directory** — `influxdb.json` embeds a live InfluxDB bearer token, and a `ConfigMap`'s contents are stored and displayed as plain text to anyone who can `kubectl get configmap -o yaml` in the namespace. `sensors.json`/`devices.json`/`assets.json` hold no secrets of their own, but they're colocated in the _same_ `Secret` object anyway — see "mount the whole directory" below for why splitting them into a separate `ConfigMap` mounted at the same path would actually break hot-reload. A `Secret` is the k8s-native primitive for exactly this case (base64-encoded at rest by default, tighter default RBAC, and the natural integration point if the cluster later adds real encryption-at-rest or an external secret manager).
+**Use a `Secret`, not a `ConfigMap`, for this directory** — `infra.json` embeds a live InfluxDB bearer token (and mqtt broker credentials), and a `ConfigMap`'s contents are stored and displayed as plain text to anyone who can `kubectl get configmap -o yaml` in the namespace. `sensors.json`/`devices.json`/`assets.json` hold no secrets of their own, but they're colocated in the _same_ `Secret` object anyway — see "mount the whole directory" below for why splitting them into a separate `ConfigMap` mounted at the same path would actually break hot-reload. A `Secret` is the k8s-native primitive for exactly this case (base64-encoded at rest by default, tighter default RBAC, and the natural integration point if the cluster later adds real encryption-at-rest or an external secret manager).
 
 ```yaml
 apiVersion: v1
@@ -185,12 +194,15 @@ metadata:
   name: smartcampusmaua-api-config
 type: Opaque
 stringData:
-  influxdb.json: |
+  infra.json: |
     {
       "version": "1",
-      "orgs": [
-        { "org": "imt", "host": "http://influxdb.maua.br:8181", "token": "..." }
-      ]
+      "influxdb": {
+        "orgs": [
+          { "org": "imt", "host": "http://influxdb.maua.br:8181", "token": "..." }
+        ]
+      },
+      "mqtt": { "broker": "mqtt.maua.br:1883", "username": "...", "password": "..." }
     }
   sensors.json: |
     { "sensors": [ ... ] }
@@ -252,9 +264,9 @@ spec:
             secretName: smartcampusmaua-api-config
 ```
 
-**Mount the whole directory (`/etc/api`), not individual files via `subPath`.** This is the one detail worth getting right on the first try: a `subPath` mount (`mountPath: /etc/api/influxdb.json` + `subPath: influxdb.json`) is a common way to mount just one key from a `Secret`/`ConfigMap`, but subPath-mounted files are **not** updated when the underlying `Secret`/`ConfigMap` changes — only a full pod restart picks up the new content. Mounting the directory instead (as above) lets kubelet sync the projected volume's contents on its own (typically within about a minute of the `Secret` changing), which is what actually lets each file's own reload timer (`INFLUXDB_CONFIG_REFRESH_SEC` for `influxdb.json`, `SENSORS_CONFIG_REFRESH_SEC` for the other three) pick up a change **without a redeploy** — the entire reason that reload logic exists in the first place. Using `subPath` for any of these four files would silently defeat it for that file specifically: the app would keep re-reading the same stale content until something forced a pod restart. This is also why `sensors.json`/`devices.json`/`assets.json` live in the _same_ `Secret`/mount as `influxdb.json` rather than a separate `ConfigMap` volume mounted alongside it at a different subpath — a container can only have one thing mounted at a given directory, so keeping all four in one object is what makes "mount the whole directory once" possible at all.
+**Mount the whole directory (`/etc/api`), not individual files via `subPath`.** This is the one detail worth getting right on the first try: a `subPath` mount (`mountPath: /etc/api/infra.json` + `subPath: infra.json`) is a common way to mount just one key from a `Secret`/`ConfigMap`, but subPath-mounted files are **not** updated when the underlying `Secret`/`ConfigMap` changes — only a full pod restart picks up the new content. Mounting the directory instead (as above) lets kubelet sync the projected volume's contents on its own (typically within about a minute of the `Secret` changing), which is what actually lets each file's own reload timer (`INFRA_CONFIG_REFRESH_SEC` for `infra.json`, `SENSORS_CONFIG_REFRESH_SEC` for the other three) pick up a change **without a redeploy** — the entire reason that reload logic exists in the first place. Using `subPath` for any of these four files would silently defeat it for that file specifically: the app would keep re-reading the same stale content until something forced a pod restart. This is also why `sensors.json`/`devices.json`/`assets.json` live in the _same_ `Secret`/mount as `infra.json` rather than a separate `ConfigMap` volume mounted alongside it at a different subpath — a container can only have one thing mounted at a given directory, so keeping all four in one object is what makes "mount the whole directory once" possible at all.
 
-Updating any of the four files: `kubectl create secret generic smartcampusmaua-api-config --from-file=influxdb.json --from-file=sensors.json --from-file=devices.json --from-file=assets.json --dry-run=client -o yaml | kubectl apply -f -` (or edit the `Secret` in place) — no rollout needed, the running pods pick it up on their own within the sync interval above. `DATABASE_URL`/`REGISTRY_WRITE_TOKEN_HASH` are plain string keys in the same `Secret`, so `kubectl edit secret smartcampusmaua-api-config` (or re-applying with `--from-literal=DATABASE_URL=...`) works the same way — a pod restart is needed for those two specifically, since they're consumed as env vars (fixed at container start), not from the live-synced volume mount the other four use.
+Updating any of the four files: `kubectl create secret generic smartcampusmaua-api-config --from-file=infra.json --from-file=sensors.json --from-file=devices.json --from-file=assets.json --dry-run=client -o yaml | kubectl apply -f -` (or edit the `Secret` in place) — no rollout needed, the running pods pick it up on their own within the sync interval above. `DATABASE_URL`/`REGISTRY_WRITE_TOKEN_HASH` are plain string keys in the same `Secret`, so `kubectl edit secret smartcampusmaua-api-config` (or re-applying with `--from-literal=DATABASE_URL=...`) works the same way — a pod restart is needed for those two specifically, since they're consumed as env vars (fixed at container start), not from the live-synced volume mount the other four use.
 
 ### Kubernetes: Postgres StatefulSet for the registry
 
@@ -271,9 +283,9 @@ Three things it deliberately does **not** cover, worth deciding on separately ra
 | Route          | Purpose   | Checks                                                                                            |
 | -------------- | --------- | ------------------------------------------------------------------------------------------------- |
 | `GET /healthz` | Liveness  | Only that the process is up and can handle HTTP — no external dependency.                         |
-| `GET /readyz`  | Readiness | That `influxdb.json` loaded successfully (`config.influxdb.orgs` is non-empty) — `503` otherwise. |
+| `GET /readyz`  | Readiness | That `infra.json` loaded successfully (`config.influxdb.orgs` is non-empty) — `503` otherwise. |
 
-Neither endpoint calls InfluxDB. This is deliberate: a k8s liveness/readiness probe that depends on an upstream service being reachable means a transient InfluxDB blip fails the probe on **every** replica at once, turning a partial upstream outage into a full self-inflicted one by having k8s restart or de-pool the whole fleet simultaneously. In practice, `/readyz`'s `503` branch is close to unreachable today — `src/config.ts` crashes the process immediately on a bad/empty initial `influxdb.json` (see "Configuration" above), so the process never reaches a listening state with zero orgs configured; the check exists mainly as a defensive signal in case that fail-fast behavior ever changes, verified by actually forcing an empty-orgs config through the container and confirming the crash-before-listening path.
+Neither endpoint calls InfluxDB. This is deliberate: a k8s liveness/readiness probe that depends on an upstream service being reachable means a transient InfluxDB blip fails the probe on **every** replica at once, turning a partial upstream outage into a full self-inflicted one by having k8s restart or de-pool the whole fleet simultaneously. In practice, `/readyz`'s `503` branch is close to unreachable today — `src/config.ts` crashes the process immediately on a bad/empty initial `infra.json` (see "Configuration" above), so the process never reaches a listening state with zero orgs configured; the check exists mainly as a defensive signal in case that fail-fast behavior ever changes, verified by actually forcing an empty-orgs config through the container and confirming the crash-before-listening path.
 
 Example k8s probe config:
 
@@ -375,7 +387,7 @@ curl "http://localhost:3333/api/timeseries/v0.4/imt/iot/sensors?assetSlug=asset-
 curl "http://localhost:3333/api/timeseries/v0.4/imt/sensors?deviceId=019c2f32-0637-7304-8bc3-bc5c58b2961c"
 ```
 
-This is a flat list, joined from [parse-mqtt-to-influxdb3](https://github.com/SmartCampusMaua/parse-mqtt-to-influxdb3)'s `sensors.json` (the canonical source `sensor_id` is actually assigned from — not derived from InfluxDB, which doesn't have `sensor_id` populated yet at all, see the footnote further down), `devices.json` (device identity/model), and `assets.json` (asset assignment). `src/sensors.ts` reads all three from `SENSORS_CONFIG_FILE`/`DEVICES_CONFIG_FILE`/`ASSETS_CONFIG_FILE`, defaulting to `../parse-mqtt-to-influxdb3/*.json` — a relative path that only resolves for a local checkout sitting next to this repo, so it's local-dev-only. The Docker image overrides all three to `/etc/api/{sensors,devices,assets}.json`, the same mounted directory `influxdb.json` already uses — see "Kubernetes: config files as a Secret volume" above. Nothing downstream depends on _how_ the files are reached, only on `sensorRegistry`'s output, so pointing the env vars anywhere else (a different mount, a shared registry service later) is a config change, not a code change. Unlike `influxdb.json`, a missing/broken registry here does **not** crash the process — hot-reloaded on the same timer as `influxdb.json` (`SENSORS_CONFIG_REFRESH_SEC`, default `30`), a load failure just makes `/sensors` (and so the picker) report the error and keeps the rest of the API working, since nothing about the core timeseries routes actually depends on this registry.
+This is a flat list, joined from [parse-mqtt-to-influxdb3](https://github.com/SmartCampusMaua/parse-mqtt-to-influxdb3)'s `sensors.json` (the canonical source `sensor_id` is actually assigned from — not derived from InfluxDB, which doesn't have `sensor_id` populated yet at all, see the footnote further down), `devices.json` (device identity/model), and `assets.json` (asset assignment). `src/sensors.ts` reads all three from `SENSORS_CONFIG_FILE`/`DEVICES_CONFIG_FILE`/`ASSETS_CONFIG_FILE`, defaulting to `../parse-mqtt-to-influxdb3/*.json` — a relative path that only resolves for a local checkout sitting next to this repo, so it's local-dev-only. The Docker image overrides all three to `/etc/api/{sensors,devices,assets}.json`, the same mounted directory `infra.json` already uses — see "Kubernetes: config files as a Secret volume" above. Nothing downstream depends on _how_ the files are reached, only on `sensorRegistry`'s output, so pointing the env vars anywhere else (a different mount, a shared registry service later) is a config change, not a code change. Unlike `infra.json`, a missing/broken registry here does **not** crash the process — hot-reloaded on the same timer as `infra.json` (`SENSORS_CONFIG_REFRESH_SEC`, default `30`), a load failure just makes `/sensors` (and so the picker) report the error and keeps the rest of the API working, since nothing about the core timeseries routes actually depends on this registry.
 
 ## API
 
